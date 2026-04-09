@@ -64,7 +64,6 @@ rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
 log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
 
-TENSORBOARD_DIR=$OUTPUT_DIR/${project_name}/${experiment_name}/tensorboard \
 python3 -m recipe.spo.spo_main_ppo \
     algorithm.adv_estimator=$adv_estimator \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
@@ -115,7 +114,7 @@ python3 -m recipe.spo.spo_main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.val_kwargs.top_k=20 \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
-    trainer.logger=['console','tensorboard'] \
+    trainer.logger=['console','wandb'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node=4 \

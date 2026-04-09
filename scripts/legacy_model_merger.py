@@ -55,10 +55,13 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoModelForTokenClassification,
-    AutoModelForVision2Seq,
     GenerationConfig,
     PretrainedConfig,
 )
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
 try:
     # for torch 2.5+

@@ -1,12 +1,12 @@
 set -x
-
+export CUDA_VISIBLE_DEVICES=3,4
 export VLLM_USE_V1=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
 
 # ================= data/model/tool =================
 OUTPUT_DIR=${OUTPUT_DIR:-"spo_verl_pr"}
-TRAIN_DATA_DIR=${TRAIN_DATA_DIR:-"DAPO-Math-17k-Processed_Splits"}
+TRAIN_DATA_DIR=${TRAIN_DATA_DIR:-"data/DAPO-Math-17k-Processed_Splits"}
 EXP_NAME=${EXP_NAME:-"training_w_value_estimator"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
@@ -14,10 +14,10 @@ N_TRAIN=${N_TRAIN:-8}
 N_VAL=${N_VAL:-16}
 METHOD=${METHOD:-"SPO"}
 DEBUG=${DEBUG:-"False"}
-OFFLINE_VALUES=${OFFLINE_VALUES:-"DAPO-Math-17k-Processed_Splits/offline_values.json"}
-VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-"True"}
+#OFFLINE_VALUES=${OFFLINE_VALUES:-"DAPO-Math-17k-Processed_Splits/offline_values.json"}
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-"False"}
 SPO_MODE=${SPO_MODE:-"baseline_only"} # stateful | baseline_only
-BASELINE_VALUES=${BASELINE_VALUES:-"/data1/home/yunhochoi/verl/dapo_math_17k_baseline_en.jsonl"}
+BASELINE_VALUES=${BASELINE_VALUES:-"/data1/home/yunhochoi/verl/data/dapo_math_17k_baseline_en.jsonl"}
 SPO_MISSING_PROMPT=${SPO_MISSING_PROMPT:-"default"} # error | default
 SPO_DEFAULT_P_HAT=${SPO_DEFAULT_P_HAT:-0.5}
 SPO_WEIGHTED_SAMPLING=${SPO_WEIGHTED_SAMPLING:-"True"}
@@ -64,11 +64,11 @@ if [ "$METHOD" = "GRPO" ]; then
     gen_batch_size=$train_batch_size
     spo_enable=False
 elif [ "$METHOD" = "SPO" ]; then
-    train_batch_size=1024
-    ppo_mini_batch_size=128
+    train_batch_size=128
+    ppo_mini_batch_size=16
     val_batch_size=96
     n_resp_per_prompt=1
-    gen_batch_size=1024 # For DAPO en subsets
+    gen_batch_size=128 # For DAPO en subsets
     spo_enable=True
 else
     echo "Error: METHOD must be either 'GRPO' or 'SPO' when DEBUG is not True"
@@ -77,7 +77,7 @@ fi
 
 # ================= perfomance =================
 infer_tp=1 # vllm
-train_sp=4 # train
+train_sp=2 # train
 offload=True
 rollout_agent_workers=${ROLLOUT_AGENT_WORKERS:-4}
 rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}
@@ -86,7 +86,6 @@ rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
 log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
 
-TENSORBOARD_DIR=$OUTPUT_DIR/${project_name}/${experiment_name}/tensorboard \
 python3 -m recipe.spo.spo_main_ppo \
     algorithm.adv_estimator=$adv_estimator \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
@@ -139,12 +138,12 @@ python3 -m recipe.spo.spo_main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.val_kwargs.top_k=20 \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
-    trainer.logger=['console','tensorboard'] \
+    trainer.logger=['console','wandb'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=2 \
     trainer.val_before_train=$VAL_BEFORE_TRAIN \
-    trainer.log_val_generations=20 \
+    trainer.log_val_generations=5 \
     trainer.nnodes=1 \
     trainer.save_freq=40 \
     trainer.default_local_dir=$default_local_dir \

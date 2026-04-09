@@ -31,13 +31,18 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoModelForTokenClassification,
-    AutoModelForVision2Seq,
     GenerationConfig,
     MistralForSequenceClassification,
     PretrainedConfig,
     PreTrainedModel,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    # transformers>=4.54 renamed AutoModelForVision2Seq to AutoModelForImageTextToText.
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
 from verl.models.registry import ModelRegistry
 from verl.utils.import_utils import is_trl_available
@@ -617,7 +622,7 @@ def patch_valuehead_model(model) -> None:
 
 
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
-    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
+    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification
 
     try:
         model = AutoModelForTokenClassification.from_pretrained(
@@ -657,6 +662,7 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
 _architecture_to_auto_class = {
     "ForCausalLM": AutoModelForCausalLM,
     "ForVision2Seq": AutoModelForVision2Seq,
+    "ForConditionalGeneration": AutoModelForVision2Seq,
     "ForTokenClassification": AutoModelForTokenClassification,
     "ForSequenceClassification": AutoModelForSequenceClassification,
 }
@@ -669,7 +675,7 @@ def get_hf_auto_model_class(hf_config):
     if has_remote_code:
         auto_class = next(k for k, v in hf_config.auto_map.items() if hf_config.architectures[0] in v)
         match auto_class:
-            case "AutoModelForVision2Seq":
+            case "AutoModelForVision2Seq" | "AutoModelForImageTextToText":
                 actor_module_class = AutoModelForVision2Seq
             case "AutoModelForCausalLM":
                 actor_module_class = AutoModelForCausalLM
