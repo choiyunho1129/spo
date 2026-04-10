@@ -37,7 +37,6 @@ project_name=spo
 experiment_name=$EXP_NAME
 default_local_dir=$OUTPUT_DIR/$project_name/$experiment_name/checkpoints
 validation_data_dir=$OUTPUT_DIR/$project_name/$experiment_name/validation_data
-rollout_data_dir=$OUTPUT_DIR/$project_name/$experiment_name/rollout_data
 
 # ================= algorithm =================
 adv_estimator=grpo
@@ -158,4 +157,3 @@ python3 -m recipe.spo.spo_main_ppo \
     trainer.spo.default_p_hat=$SPO_DEFAULT_P_HAT \
     trainer.spo.weighted_sampling=$SPO_WEIGHTED_SAMPLING \
     trainer.debug=$DEBUG  \
-    trainer.rollout_data_dir=$rollout_data_dir
