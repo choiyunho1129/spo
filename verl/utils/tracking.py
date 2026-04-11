@@ -18,10 +18,14 @@ A unified tracking interface that supports logging data to different backend
 import dataclasses
 import json
 import os
+import atexit
+import logging
 from enum import Enum
 from functools import partial
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class Tracking:
@@ -59,6 +63,8 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self._closed = False
+        self._atexit_handler = self.close
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -67,10 +73,25 @@ class Tracking:
 
             settings = None
             if config and config["trainer"].get("wandb_proxy", None):
-                settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
+                wandb_proxy = config["trainer"]["wandb_proxy"]
+                if hasattr(wandb, "Settings"):
+                    try:
+                        settings = wandb.Settings(https_proxy=wandb_proxy)
+                    except Exception:
+                        logger.exception("Failed to build wandb.Settings; falling back to environment proxy.")
+                        os.environ.setdefault("HTTPS_PROXY", str(wandb_proxy))
+                else:
+                    os.environ.setdefault("HTTPS_PROXY", str(wandb_proxy))
             entity = os.environ.get("WANDB_ENTITY", None)
-            wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
-            self.logger["wandb"] = wandb
+            try:
+                wandb_init = getattr(wandb, "init", None)
+                if callable(wandb_init):
+                    wandb_init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
+                    self.logger["wandb"] = _WandbAdapter(wandb)
+                else:
+                    logger.warning("wandb module is available but has no init(); disabling wandb backend.")
+            except Exception:
+                logger.exception("Failed to initialize wandb logger; continuing without wandb backend.")
 
         if "trackio" in default_backend:
             import trackio
@@ -149,27 +170,68 @@ class Tracking:
 
         if "file" in default_backend:
             self.logger["file"] = FileLogger(project_name, experiment_name)
+        atexit.register(self._atexit_handler)
 
     def log(self, data, step, backend=None):
-        for default_backend, logger_instance in self.logger.items():
+        for default_backend, logger_instance in list(self.logger.items()):
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                try:
+                    logger_instance.log(data=data, step=step)
+                except Exception:
+                    logger.exception(
+                        "Logger backend '%s' failed at step=%s and will be disabled.", default_backend, step
+                    )
+                    self.logger.pop(default_backend, None)
 
     def __del__(self):
+        if hasattr(self, "_closed"):
+            self.close()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._atexit_handler is not None:
+            try:
+                atexit.unregister(self._atexit_handler)
+            except Exception:
+                pass
+            self._atexit_handler = None
         if "wandb" in self.logger:
-            self.logger["wandb"].finish(exit_code=0)
+            try:
+                self.logger["wandb"].finish(exit_code=0)
+            except Exception:
+                logger.exception("Failed to finish wandb logger cleanly.")
         if "swanlab" in self.logger:
-            self.logger["swanlab"].finish()
+            try:
+                self.logger["swanlab"].finish()
+            except Exception:
+                logger.exception("Failed to finish swanlab logger cleanly.")
         if "vemlp_wandb" in self.logger:
-            self.logger["vemlp_wandb"].finish(exit_code=0)
+            try:
+                self.logger["vemlp_wandb"].finish(exit_code=0)
+            except Exception:
+                logger.exception("Failed to finish vemlp_wandb logger cleanly.")
         if "tensorboard" in self.logger:
-            self.logger["tensorboard"].finish()
+            try:
+                self.logger["tensorboard"].finish()
+            except Exception:
+                logger.exception("Failed to finish tensorboard logger cleanly.")
         if "clearml" in self.logger:
-            self.logger["clearml"].finish()
+            try:
+                self.logger["clearml"].finish()
+            except Exception:
+                logger.exception("Failed to finish clearml logger cleanly.")
         if "trackio" in self.logger:
-            self.logger["trackio"].finish()
+            try:
+                self.logger["trackio"].finish()
+            except Exception:
+                logger.exception("Failed to finish trackio logger cleanly.")
         if "file" in self.logger:
-            self.logger["file"].finish()
+            try:
+                self.logger["file"].finish()
+            except Exception:
+                logger.exception("Failed to finish file logger cleanly.")
 
 
 class ClearMLLogger:
@@ -244,6 +306,45 @@ class FileLogger:
 
     def finish(self):
         self.fp.close()
+
+
+class _WandbAdapter:
+    def __init__(self, wandb_module):
+        self._wandb = wandb_module
+        self._disabled = False
+
+    def log(self, data, step):
+        if self._disabled:
+            return
+        run = getattr(self._wandb, "run", None)
+        if run is None:
+            self._disabled = True
+            logger.warning("wandb backend is not active; disabling wandb logging.")
+            return
+        wandb_log = getattr(self._wandb, "log", None)
+        if not callable(wandb_log):
+            self._disabled = True
+            logger.warning("wandb backend has no log(); disabling wandb logging.")
+            return
+        try:
+            wandb_log(data=data, step=step)
+        except Exception:
+            self._disabled = True
+            logger.exception("wandb.log failed; disabling wandb logging for the rest of the run.")
+
+    def finish(self, exit_code=0):
+        if self._disabled:
+            return
+        run = getattr(self._wandb, "run", None)
+        if run is None:
+            return
+        wandb_finish = getattr(self._wandb, "finish", None)
+        if not callable(wandb_finish):
+            return
+        try:
+            wandb_finish(exit_code=exit_code)
+        except Exception:
+            logger.exception("wandb.finish failed during teardown.")
 
 
 class _TensorboardAdapter:
@@ -336,6 +437,7 @@ def _flatten_dict(raw: dict[str, Any], *, sep: str) -> dict[str, Any]:
 class ValidationGenerationsLogger:
     project_name: str = None
     experiment_name: str = None
+    _wandb_logging_disabled: bool = False
 
     def log(self, loggers, samples, step):
         if "wandb" in loggers:
@@ -361,10 +463,18 @@ class ValidationGenerationsLogger:
     def log_generations_to_wandb(self, samples, step):
         import wandb
 
+        if self._wandb_logging_disabled:
+            return
+        if wandb.run is None:
+            self._wandb_logging_disabled = True
+            logger.warning("wandb run is not active; disabling validation generation logging to wandb.")
+            return
         self._log_generations_to_wandb(samples, step, wandb)
 
     def _log_generations_to_wandb(self, samples, step, wandb):
         """Log samples to wandb as a table"""
+        if self._wandb_logging_disabled:
+            return
 
         # Create column names for all samples
         columns = ["step"] + sum(
@@ -388,7 +498,12 @@ class ValidationGenerationsLogger:
         new_table.add_data(*row_data)
 
         # Update reference and log
-        wandb.log({"val/generations": new_table}, step=step)
+        try:
+            wandb.log({"val/generations": new_table}, step=step)
+        except Exception:
+            self._wandb_logging_disabled = True
+            logger.exception("Failed to log validation generations to wandb; disabling this logger.")
+            return
         self.validation_table = new_table
 
     def log_generations_to_swanlab(self, samples, step):

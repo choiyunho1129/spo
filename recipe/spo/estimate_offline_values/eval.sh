@@ -1,21 +1,27 @@
 set -x
 
-export CUDA_VISIBLE_DEVICES=1,2,3,4
+export CUDA_VISIBLE_DEVICES=1,2
 export VLLM_USE_V1=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+# wandb stability (override if needed)
+export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
+export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
+export WANDB_INIT_TIMEOUT=${WANDB_INIT_TIMEOUT:-300}
+export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
 
 # ================= data/model/tool =================
 OUTPUT_DIR=${OUTPUT_DIR:-"spo_verl_pr"}
-DATA_FILE=${DATA_FILE:-""}
+DATA_FILE=${DATA_FILE:-"/data1/home/yunhochoi/verl/data/DAPO-Math-17k-Processed_Splits/subset_13_sample50.parquet"}
 EXP_NAME=${EXP_NAME:-"offline_value_estimation"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
-N_VAL=4
+N_VAL=2
 DEBUG=${DEBUG:-"False"}
+export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_DIR}/wandb"}
 
-train_files="['${DATA_FILE}']"
-val_files="$train_files"
+train_files="['/data1/home/yunhochoi/verl/data/DAPO-Math-17k-Processed_Splits/subset_13.parquet']"
+val_files="$DATA_FILE"
 echo "Evaluating on train_files"
 
 # tool
@@ -55,7 +61,7 @@ n_resp_per_prompt_val=$N_VAL
 
 # ================= perfomance =================
 infer_tp=1 # vllm
-train_sp=4 # train
+train_sp=2 # train
 offload=True
 rollout_agent_workers=${ROLLOUT_AGENT_WORKERS:-4}
 rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}
@@ -117,7 +123,7 @@ python3 -m recipe.spo.spo_main_ppo \
     trainer.logger=['console','wandb'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=2 \
     trainer.val_before_train=True \
     trainer.val_only=True \
     trainer.log_val_generations=20 \

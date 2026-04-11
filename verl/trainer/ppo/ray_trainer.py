@@ -426,6 +426,19 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
+    @staticmethod
+    def _json_default(obj):
+        """Convert common non-JSON-native tensor/ndarray scalar types to Python types."""
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, torch.Tensor):
+            if obj.ndim == 0 or obj.numel() == 1:
+                return obj.item()
+            return obj.detach().cpu().tolist()
+        raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
@@ -447,7 +460,7 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(json.dumps(entry, ensure_ascii=False, default=self._json_default))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")

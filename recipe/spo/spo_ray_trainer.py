@@ -101,7 +101,7 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(json.dumps(entry, ensure_ascii=False, default=self._json_default))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")

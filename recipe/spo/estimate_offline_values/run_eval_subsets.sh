@@ -11,7 +11,7 @@ DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/DAPO-Math-17k-Processed_Splits}"
 
 cd "${REPO_ROOT}"
 
-for i in $(seq 2 14); do
+for i in $(seq 6 13); do
     data_file="${DATA_DIR}/subset_${i}.parquet"
     exp_name="offline_value_estimation_subset_${i}"
 
@@ -28,4 +28,3 @@ for i in $(seq 2 14); do
     bash "${SCRIPT_DIR}/eval.sh"
 done
 
-echo "[DONE] Completed subset_2 through subset_14"

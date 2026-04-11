@@ -1,29 +1,34 @@
 set -x
-export CUDA_VISIBLE_DEVICES=3,4
+export CUDA_VISIBLE_DEVICES=1,2
 export VLLM_USE_V1=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+# wandb stability (override if needed)
+export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
+export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
+export WANDB_INIT_TIMEOUT=${WANDB_INIT_TIMEOUT:-300}
+export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
 
-# ================= data/model/tool =================
 OUTPUT_DIR=${OUTPUT_DIR:-"spo_verl_pr"}
 TRAIN_DATA_DIR=${TRAIN_DATA_DIR:-"data/DAPO-Math-17k-Processed_Splits"}
-EXP_NAME=${EXP_NAME:-"training_w_value_estimator"}
+EXP_NAME=${EXP_NAME:-"Qwen3-4B_Baseline_SPO_batch_32"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
-N_TRAIN=${N_TRAIN:-8}
-N_VAL=${N_VAL:-16}
+N_VAL=${N_VAL:-8}
 METHOD=${METHOD:-"SPO"}
 DEBUG=${DEBUG:-"False"}
 #OFFLINE_VALUES=${OFFLINE_VALUES:-"DAPO-Math-17k-Processed_Splits/offline_values.json"}
-VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-"False"}
 SPO_MODE=${SPO_MODE:-"baseline_only"} # stateful | baseline_only
-BASELINE_VALUES=${BASELINE_VALUES:-"/data1/home/yunhochoi/verl/data/dapo_math_17k_baseline_en.jsonl"}
+BASELINE_VALUES=${BASELINE_VALUES:-"/data1/home/yunhochoi/verl/data/dapo_math_17k_baseline.jsonl"}
 SPO_MISSING_PROMPT=${SPO_MISSING_PROMPT:-"default"} # error | default
 SPO_DEFAULT_P_HAT=${SPO_DEFAULT_P_HAT:-0.5}
 SPO_WEIGHTED_SAMPLING=${SPO_WEIGHTED_SAMPLING:-"True"}
+export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_DIR}/wandb"}
 
-train_files="['${TRAIN_DATA_DIR}/subset_0.parquet', '$TRAIN_DATA_DIR/subset_1.parquet', '$TRAIN_DATA_DIR/subset_2.parquet', '$TRAIN_DATA_DIR/subset_3.parquet', '$TRAIN_DATA_DIR/subset_4.parquet']"
-val_files="['Maxwell-Jia/AIME_2024', 'yentinglin/aime_2025']"
+train_files="['${TRAIN_DATA_DIR}/all.parquet']"
+AIME_2024_FILE=${AIME_2024_FILE:-"data/AIME_2024.parquet"}
+AIME_2025_FILE=${AIME_2025_FILE:-"data/AIME_2025.parquet"}
+val_files="['${AIME_2024_FILE}', '${AIME_2025_FILE}']"
 
 # tool
 tool_config_path=recipe/spo/spo_tool_config.yaml
@@ -33,7 +38,7 @@ agent_loop_config_path=recipe/spo/config/spo_agent.yaml
 default_agent_loop=spo_tool_agent
 
 # wandb
-project_name=spo
+project_name='ValueEstimator'
 experiment_name=$EXP_NAME
 default_local_dir=$OUTPUT_DIR/$project_name/$experiment_name/checkpoints
 validation_data_dir=$OUTPUT_DIR/$project_name/$experiment_name/validation_data
@@ -54,6 +59,11 @@ max_prompt_length=2048
 max_response_length=$RESPONSE_LENGTH
 actor_lr=1e-6
 
+data_prompt_key=prompt
+filter_overlong_prompts=True
+reward_manager=naive
+
+N_TRAIN=${N_TRAIN:-8}
 n_resp_per_prompt=$N_TRAIN
 n_resp_per_prompt_val=$N_VAL
 if [ "$METHOD" = "GRPO" ]; then
@@ -63,15 +73,26 @@ if [ "$METHOD" = "GRPO" ]; then
     gen_batch_size=$train_batch_size
     spo_enable=False
 elif [ "$METHOD" = "SPO" ]; then
-    train_batch_size=128
-    ppo_mini_batch_size=16
+    train_batch_size=1024
+    ppo_mini_batch_size=128
     val_batch_size=96
     n_resp_per_prompt=1
-    gen_batch_size=128 # For DAPO en subsets
+    gen_batch_size=1024 # For DAPO en subsets
     spo_enable=True
 else
     echo "Error: METHOD must be either 'GRPO' or 'SPO' when DEBUG is not True"
     exit 1
+fi
+
+# Match DAPO single-turn preprocessing and scoring: use source_prompt, DAPO reward manager,
+# and bypass tool-specific agent configuration entirely.
+if [ "$max_turns" -eq 1 ]; then
+    data_prompt_key=source_prompt
+    filter_overlong_prompts=False
+    reward_manager=dapo
+    tool_config_path=null
+    agent_loop_config_path=null
+    default_agent_loop=single_turn_agent
 fi
 
 # ================= perfomance =================
@@ -79,7 +100,6 @@ infer_tp=1 # vllm
 train_sp=2 # train
 offload=True
 rollout_agent_workers=${ROLLOUT_AGENT_WORKERS:-4}
-rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}
 rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
 
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
@@ -91,18 +111,20 @@ python3 -m recipe.spo.spo_main_ppo \
     algorithm.kl_ctrl.kl_coef=$kl_coef \
     data.train_files="$train_files" \
     data.val_files="$val_files" \
+    data.prompt_key=$data_prompt_key \
     data.return_raw_chat=True \
     data.train_batch_size=$train_batch_size \
     data.val_batch_size=$val_batch_size \
     data.max_prompt_length=$max_prompt_length \
     data.max_response_length=$max_response_length \
-    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts=$filter_overlong_prompts \
     data.truncation='error' \
     data.custom_cls.path=recipe/spo/spo_retool.py \
     data.custom_cls.name=CustomRLHFDataset \
     +data.gen_batch_size=$gen_batch_size \
     custom_reward_function.path=recipe/spo/spo_retool.py \
     custom_reward_function.name=compute_score \
+    reward_model.reward_manager=$reward_manager \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
@@ -122,7 +144,7 @@ python3 -m recipe.spo.spo_main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$infer_tp \
-    actor_rollout_ref.rollout.max_num_batched_tokens=$rollout_max_num_batched_tokens \
+    actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
     actor_rollout_ref.rollout.max_num_seqs=$rollout_max_num_seqs \
     actor_rollout_ref.rollout.agent.num_workers=$rollout_agent_workers \
     actor_rollout_ref.rollout.multi_turn.enable=False \
@@ -140,8 +162,8 @@ python3 -m recipe.spo.spo_main_ppo \
     trainer.logger=['console','wandb'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.n_gpus_per_node=2 \
-    trainer.val_before_train=$VAL_BEFORE_TRAIN \
+    trainer.n_gpus_per_node=$train_sp \
+    trainer.val_before_train=True \
     trainer.log_val_generations=5 \
     trainer.nnodes=1 \
     trainer.save_freq=40 \
