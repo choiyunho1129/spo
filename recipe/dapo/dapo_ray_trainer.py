@@ -42,6 +42,26 @@ from verl.utils.profiler import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
 
 
+def _get_generated_token_stats(batch: DataProto) -> dict[str, int]:
+    """Collect valid token stats from one rollout output batch."""
+    attention_mask = batch.batch["attention_mask"]
+    response_length = batch.batch["responses"].shape[-1]
+    prompt_mask = attention_mask[:, :-response_length]
+    response_mask = attention_mask[:, -response_length:]
+
+    prompt_tokens = int(prompt_mask.sum().item())
+    response_tokens = int(response_mask.sum().item())
+    total_tokens = int(attention_mask.sum().item())
+    num_sequences = int(attention_mask.shape[0])
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "response_tokens": response_tokens,
+        "total_tokens": total_tokens,
+        "num_sequences": num_sequences,
+    }
+
+
 class RayDAPOTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -131,6 +151,10 @@ class RayDAPOTrainer(RayPPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
+        step_generated_prompt_tokens = 0
+        step_generated_response_tokens = 0
+        step_generated_total_tokens = 0
+        step_generated_num_sequences = 0
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
@@ -159,12 +183,22 @@ class RayDAPOTrainer(RayPPOTrainer):
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        gen_stats = _get_generated_token_stats(gen_batch_output)
+                        step_generated_prompt_tokens += gen_stats["prompt_tokens"]
+                        step_generated_response_tokens += gen_stats["response_tokens"]
+                        step_generated_total_tokens += gen_stats["total_tokens"]
+                        step_generated_num_sequences += gen_stats["num_sequences"]
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, "red"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
                             gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                            baseline_stats = _get_generated_token_stats(gen_baseline_output)
+                            step_generated_prompt_tokens += baseline_stats["prompt_tokens"]
+                            step_generated_response_tokens += baseline_stats["response_tokens"]
+                            step_generated_total_tokens += baseline_stats["total_tokens"]
+                            step_generated_num_sequences += baseline_stats["num_sequences"]
 
                             new_batch = new_batch.union(gen_baseline_output)
                             # compute reward model score on new_batch
@@ -395,12 +429,24 @@ class RayDAPOTrainer(RayPPOTrainer):
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                metrics["perf/step_generated_total_num_tokens"] = step_generated_total_tokens
+                metrics["perf/step_generated_total_num_prompt_tokens"] = step_generated_prompt_tokens
+                metrics["perf/step_generated_total_num_response_tokens"] = step_generated_response_tokens
+                metrics["perf/step_generated_total_num_sequences"] = step_generated_num_sequences
+                if metrics["perf/total_num_tokens"] > 0:
+                    metrics["perf/step_generated_to_trained_token_ratio"] = (
+                        step_generated_total_tokens / metrics["perf/total_num_tokens"]
+                    )
                 timing_raw = defaultdict(float)  # clear timing
 
                 metrics["train/num_gen_batches"] = num_gen_batches
                 batch = None
                 num_prompt_in_batch = 0
                 num_gen_batches = 0
+                step_generated_prompt_tokens = 0
+                step_generated_response_tokens = 0
+                step_generated_total_tokens = 0
+                step_generated_num_sequences = 0
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

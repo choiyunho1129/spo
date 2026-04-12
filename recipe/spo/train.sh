@@ -1,5 +1,5 @@
 set -x
-export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=1,2,3,4
 export VLLM_USE_V1=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
@@ -11,7 +11,7 @@ export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
 
 OUTPUT_DIR=${OUTPUT_DIR:-"spo_verl_pr"}
 TRAIN_DATA_DIR=${TRAIN_DATA_DIR:-"data/DAPO-Math-17k-Processed_Splits"}
-EXP_NAME=${EXP_NAME:-"Qwen3-4B_Baseline_SPO_batch_32"}
+EXP_NAME=${EXP_NAME:-"Qwen3-4B_EstimatedValue_SPO_batch_1024"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
 N_VAL=${N_VAL:-8}
@@ -57,7 +57,7 @@ clip_ratio_high=0.28
 max_turns=1
 max_prompt_length=2048
 max_response_length=$RESPONSE_LENGTH
-actor_lr=1e-6
+actor_lr=2e-6
 
 data_prompt_key=prompt
 filter_overlong_prompts=True
@@ -75,7 +75,7 @@ if [ "$METHOD" = "GRPO" ]; then
 elif [ "$METHOD" = "SPO" ]; then
     train_batch_size=1024
     ppo_mini_batch_size=128
-    val_batch_size=96
+    val_batch_size=128
     n_resp_per_prompt=1
     gen_batch_size=1024 # For DAPO en subsets
     spo_enable=True
@@ -97,7 +97,7 @@ fi
 
 # ================= perfomance =================
 infer_tp=1 # vllm
-train_sp=2 # train
+train_sp=4 # train
 offload=True
 rollout_agent_workers=${ROLLOUT_AGENT_WORKERS:-4}
 rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
@@ -134,6 +134,7 @@ python3 -m recipe.spo.spo_main_ppo \
     actor_rollout_ref.actor.clip_ratio_high=$clip_ratio_high \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
     actor_rollout_ref.actor.optim.lr=$actor_lr \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=$ppo_mini_batch_size \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$actor_max_token_len_per_gpu \
@@ -153,7 +154,7 @@ python3 -m recipe.spo.spo_main_ppo \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=$tool_config_path \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
     actor_rollout_ref.rollout.agent.default_agent_loop=$default_agent_loop \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
@@ -166,9 +167,9 @@ python3 -m recipe.spo.spo_main_ppo \
     trainer.val_before_train=True \
     trainer.log_val_generations=5 \
     trainer.nnodes=1 \
-    trainer.save_freq=40 \
     trainer.default_local_dir=$default_local_dir \
     trainer.validation_data_dir=$validation_data_dir \
+    trainer.save_freq=20 \
     trainer.test_freq=10 \
     trainer.total_epochs=500 \
     trainer.spo.enable=$spo_enable \

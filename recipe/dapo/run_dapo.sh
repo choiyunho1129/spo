@@ -2,9 +2,9 @@
 set -xeuo pipefail
 
 project_name='ValueEstimator'
-exp_name='Qwen3-4B_Baseline_DAPO_batch_32'
+exp_name='Qwen3-4B_Baseline_DAPO_batch_1024'
 
-export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=1,2,3,4
 adv_estimator=grpo
 
 use_kl_in_reward=False
@@ -53,7 +53,7 @@ top_p=0.95
 top_k=20 # 0 for HF rollout, -1 for vLLM rollout
 
 infer_tp=1 # vllm
-train_sp=2 # train
+train_sp=4 # train
 offload=True
 rollout_agent_workers=${ROLLOUT_AGENT_WORKERS:-4}
 rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
@@ -76,7 +76,7 @@ python3 -m recipe.dapo.main_dapo \
     data.max_response_length=${max_response_length} \
     data.gen_batch_size=${gen_prompt_bsz} \
     data.train_batch_size=${train_prompt_bsz} \
-    data.val_batch_size=96 \
+    data.val_batch_size=256 \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \

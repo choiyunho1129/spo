@@ -423,7 +423,7 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 raise ValueError(
                                     f"Baseline p_hat must be in [0, 1] for prompt='{prompt[:80]}...', got: {baseline}"
                                 )
-                            prompt2baseline[prompt] = baseline
+                            prompt2baseline[prompt.strip()] = baseline
                     else:
                         raise TypeError(
                             f"Expected JSON object for baseline values, got {type(loaded_baseline)}; "
@@ -461,7 +461,20 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 raise ValueError(
                                     f"Baseline p_hat must be in [0, 1] for prompt='{item['prompt'][:80]}...', got: {baseline}"
                                 )
-                            prompt2baseline[item["prompt"]] = baseline
+                            prompt2baseline[item["prompt"].strip()] = baseline
+
+                            # Allow baseline matching when training prompt_key=source_prompt.
+                            source_prompt = item.get("source_prompt")
+                            source_prompt_content = None
+                            if isinstance(source_prompt, list | tuple) and source_prompt:
+                                first_turn = source_prompt[0]
+                                if isinstance(first_turn, dict):
+                                    source_prompt_content = first_turn.get("content")
+                            elif isinstance(source_prompt, dict):
+                                source_prompt_content = source_prompt.get("content")
+
+                            if isinstance(source_prompt_content, str):
+                                prompt2baseline[source_prompt_content.strip()] = baseline
 
                 full_prompts = list(prompt2baseline.keys())
                 print(
