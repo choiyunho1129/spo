@@ -1,0 +1,44 @@
+{
+  "prompt_hidden": {
+    "input_field": "prompt_hidden_states",
+    "layer_index": 26,
+    "pooling": {
+      "type": "last_n_mean",
+      "n": 6
+    }
+  },
+  "response_hidden": {
+    "input_field": "response_hidden_states",
+    "layer_index": 26,
+    "pooling": {
+      "type": "last_n_mean",
+      "n": 10
+    }
+  },
+  "rollout_scalars": {
+    "scalar_keys": [
+      "output_length",
+      "think_tokens",
+      "answer_tokens",
+      "has_complete_answer",
+      "has_reasoning_content",
+      "output_mean_token_entropy",
+      "reasoning_mean_token_entropy",
+      "answer_mean_token_entropy",
+      "output_unique_token_ratio",
+      "answer_unique_token_ratio",
+      "output_repetition_ratio",
+      "reasoning_repetition_ratio",
+      "duplicate_line_ratio"
+    ],
+    "derived_scalar_keys": [
+      "think_ratio",
+      "answer_ratio",
+      "entropy_gap_reasoning_answer",
+      "unique_gap_reasoning_output",
+      "repetition_gap_reasoning_output",
+      "reasoning_x_log_output_length",
+      "answer_entropy_gap_vs_output"
+    ]
+  }
+}

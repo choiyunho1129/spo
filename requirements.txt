@@ -4,6 +4,7 @@ codetiming
 datasets
 dill
 hydra-core
+joblib
 liger-kernel
 numpy<2.0.0
 pandas
@@ -13,6 +14,7 @@ pybind11
 pylatexenc
 pre-commit
 ray[default]
+scikit-learn
 tensordict>=0.8.0,<=0.10.0,!=0.9.0
 torchdata
 transformers

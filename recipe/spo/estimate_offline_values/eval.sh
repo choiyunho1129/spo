@@ -16,7 +16,7 @@ DATA_FILE=${DATA_FILE:-"/data1/home/yunhochoi/verl/data/DAPO-Math-17k-Processed_
 EXP_NAME=${EXP_NAME:-"offline_value_estimation"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
-N_VAL=2
+N_VAL=${N_VAL:-2}
 DEBUG=${DEBUG:-"False"}
 export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_DIR}/wandb"}
 
@@ -44,13 +44,13 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 
-max_turns=1
+max_turns=
 max_prompt_length=2048
 max_response_length=$RESPONSE_LENGTH
 actor_lr=1e-6
 
 train_batch_size=64
-val_batch_size=12
+val_batch_size=128
 if [ "$DEBUG" = "True" ]; then
     train_batch_size=16
     val_batch_size=16

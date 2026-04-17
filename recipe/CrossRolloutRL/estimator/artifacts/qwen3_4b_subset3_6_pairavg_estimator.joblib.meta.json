@@ -1,0 +1,27 @@
+{
+  "model_path": "Qwen/Qwen3-4B",
+  "device": "cuda",
+  "dtype": "torch.bfloat16",
+  "subset_ids": [
+    3,
+    4,
+    5,
+    6
+  ],
+  "pair_selection": "random",
+  "seed": 42,
+  "rollouts_per_prompt": 2,
+  "total_prompts": 2820,
+  "used_prompts": 2820,
+  "skipped_prompts": 0,
+  "failure_counter": {},
+  "num_rows": 5640,
+  "train_label_mean": 0.4833333194255829,
+  "train_label_min": 0.0,
+  "train_label_max": 1.0,
+  "train_mae": 0.1258525848388672,
+  "train_rmse": 0.18877197003552962,
+  "feature_builder_config_path": "/data1/home/yunhochoi/verl/recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_feature_builder_config.json",
+  "fit_config_path": "/data1/home/yunhochoi/verl/recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_estimator_fit_config.json",
+  "output_model_path": "/data1/home/yunhochoi/verl/recipe/CrossRolloutRL/estimator/artifacts/qwen3_4b_subset3_6_pairavg_estimator.joblib"
+}

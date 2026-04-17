@@ -1,0 +1,12 @@
+{
+  "name": "value_estimator_qwen3_4b",
+  "description": "",
+  "feature_builder_config_path": "single_trajectory_estimator_support/default_feature_builder_config.json",
+  "estimator_fit_config_path": "single_trajectory_estimator_support/default_estimator_fit_config.json",
+  "training_status": {
+    "model_ready": false,
+    "reason": "",
+    "expected_bundle_type": "single_trajectory_estimator",
+    "expected_model_output": "value"
+  }
+}
