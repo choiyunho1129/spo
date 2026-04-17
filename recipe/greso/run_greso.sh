@@ -4,7 +4,7 @@ set -xeuo pipefail
 project_name='ValueEstimator'
 exp_name='Qwen3-4B_Baseline_GRESO_batch_1024'
 
-export CUDA_VISIBLE_DEVICES=3,4
+export CUDA_VISIBLE_DEVICES=1,2,3,4
 adv_estimator=grpo
 
 use_kl_in_reward=False
@@ -23,10 +23,9 @@ loss_agg_mode="token-mean"
 
 enable_filter_groups=True
 filter_groups_metric=acc
-max_num_gen_batches=10
 train_prompt_bsz=128
-gen_prompt_bsz=$((train_prompt_bsz * 2))
-train_prompt_mini_bsz=16
+gen_prompt_bsz=8
+train_prompt_mini_bsz=32
 n_resp_per_prompt=8
 
 # Ray
@@ -53,7 +52,7 @@ top_p=0.95
 top_k=20 # 0 for HF rollout, -1 for vLLM rollout
 
 infer_tp=1 # vllm
-train_sp=2 # train
+train_sp=4 # train
 offload=True
 rollout_agent_workers=${ROLLOUT_AGENT_WORKERS:-4}
 rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
@@ -97,7 +96,6 @@ python3 -m recipe.greso.main_greso \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
-    algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_max_token_len_per_gpu} \

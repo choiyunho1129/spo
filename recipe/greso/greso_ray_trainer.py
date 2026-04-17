@@ -237,6 +237,23 @@ class RayGRESOTrainer(RayPPOTrainer):
                 new_batch = new_batch[kept_indices]
                 # =================================================================
 
+                # =================================================================
+                # [GRESO 1단계-개편]: rollout 전에 prompt만 먼저 누적
+                # =================================================================
+                if pre_filter_buffer is None:
+                    pre_filter_buffer = new_batch
+                else:
+                    pre_filter_buffer = DataProto.concat([pre_filter_buffer, new_batch])
+
+                current_prompts = len(set(pre_filter_buffer.non_tensor_batch["uid"]))
+                if current_prompts < target_accumulation_size:
+                    print(f"{current_prompts:} / {target_accumulation_size:} prompts accumulated. Wait for rollout.")
+                    continue
+
+                # carry-over 없이, 목표치에 도달한 prompt 풀 전체에 대해 한 번에 rollout 수행
+                new_batch = pre_filter_buffer
+                pre_filter_buffer = None
+
                 num_gen_batches += 1
                 gen_batch = self._get_gen_batch(new_batch)
                 gen_batch_output = gen_batch.repeat(
@@ -330,24 +347,10 @@ class RayGRESOTrainer(RayPPOTrainer):
                             new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
 
                     # =================================================================
-                    # [GRESO 1단계]: 8개(gen_batch)씩 뽑힌 데이터를 Pool에 무조건 붓는다
+                    # [GRESO 2단계-개편]: target prompt pool rollout 결과를 바로 필터링
                     # =================================================================
-                    if pre_filter_buffer is None:
-                        pre_filter_buffer = new_batch
-                    else:
-                        pre_filter_buffer = DataProto.concat([pre_filter_buffer, new_batch])
+                    pre_filter_buffer = new_batch
 
-                    # 현재 Pool에 모인 "고유 질문(Prompt)"의 개수를 확인
-                    current_prompts = len(set(pre_filter_buffer.non_tensor_batch["uid"]))
-
-                    # 우리가 원했던 거대한 Pool 크기(192개 또는 Br)에 도달 못했으면?
-                    if current_prompts < target_accumulation_size:
-                        print(f"{current_prompts:} / {target_accumulation_size:} generated. Repeat.")
-                        continue # 필터링 하지 말고 계속 8개씩 더 뽑아와!
-                        
-                    # =================================================================
-                    # [GRESO 2단계]: Pool이 꽉 찼다! 이제 거대 Pool 전체를 대상으로 필터링!
-                    # =================================================================
                     metric_name = self.config.algorithm.filter_groups.metric
                     if metric_name == "seq_final_reward":
                         pre_filter_buffer.non_tensor_batch["seq_final_reward"] = (
@@ -494,11 +497,13 @@ class RayGRESOTrainer(RayPPOTrainer):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
-                    # Compute rollout correction weights and off-policy metrics (inherited from RayPPOTrainer)
-                    from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
-
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
+                        # `rollout_corr_helper` only exists in newer verl versions.
+                        # Import lazily so the default path still works on older checkouts
+                        # where rollout correction is not configured.
+                        from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
                         batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
                         # IS and off-policy metrics already have rollout_corr/ prefix
                         metrics.update(is_metrics)

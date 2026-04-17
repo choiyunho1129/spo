@@ -33,7 +33,6 @@ algorithm:
     _target_: verl.trainer.config.FilterGroupsConfig
     enable: True 
     metric: acc 
-    max_num_gen_batches: 0
 
 trainer:
   project_name: verl-dapo

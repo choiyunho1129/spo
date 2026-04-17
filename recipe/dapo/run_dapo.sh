@@ -135,4 +135,4 @@ python3 -m recipe.dapo.main_dapo \
     trainer.total_epochs=10 \
     trainer.total_training_steps=1500 \
     trainer.val_only=False \
-    trainer.val_before_train=True
+    trainer.val_before_train=False
