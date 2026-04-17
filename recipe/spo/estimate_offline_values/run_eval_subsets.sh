@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-
+#need to be checked
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,6 +9,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-spo_verl_pr}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-4B}"
 DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/DAPO-Math-17k-Processed_Splits}"
 TARGET_TRAJECTORIES="${TARGET_TRAJECTORIES:-4}"
+SUBSET_SPECIAL_TARGET="${SUBSET_SPECIAL_TARGET:-8}"
 SUBSET_START="${SUBSET_START:-}"
 SUBSET_END="${SUBSET_END:-}"
 INCREMENTAL_UTIL="${SCRIPT_DIR}/incremental_eval.py"
@@ -44,9 +45,8 @@ for data_file in "${subset_files[@]}"; do
 
     processed_count=$((processed_count + 1))
 
-    # subset 0, 1 only -> target trajectories = 32
     if [[ "${subset_id}" == "0" || "${subset_id}" == "1" ]]; then
-        run_target_trajectories=32
+        run_target_trajectories="${SUBSET_SPECIAL_TARGET}"
     else
         run_target_trajectories="${TARGET_TRAJECTORIES}"
     fi
@@ -132,4 +132,4 @@ if [[ ${#failed_subsets[@]} -gt 0 ]]; then
     exit 1
 fi
 
-echo "[DONE] processed=${processed_count}, skipped=${skip_count}, default_target=${TARGET_TRAJECTORIES} (subset_0,1=32)"
+echo "[DONE] processed=${processed_count}, skipped=${skip_count}, default_target=${TARGET_TRAJECTORIES} (subset_0,1=${SUBSET_SPECIAL_TARGET})"

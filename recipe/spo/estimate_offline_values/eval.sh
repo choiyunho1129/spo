@@ -1,6 +1,6 @@
 set -x
 
-export CUDA_VISIBLE_DEVICES=1,2,3,4
+export CUDA_VISIBLE_DEVICES=3
 export VLLM_USE_V1=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
@@ -20,7 +20,7 @@ N_VAL=${N_VAL:-2}
 DEBUG=${DEBUG:-"False"}
 export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_DIR}/wandb"}
 
-train_files="['/data1/home/yunhochoi/verl/data/DAPO-Math-17k-Processed_Splits/subset_13.parquet']"
+train_files="['/NHNHOME/WORKSPACE/26msit006_A/kisti/snu/yunhochoi/spo/data/DAPO-Math-17k-Processed_Splits/subset_13.parquet']"
 val_files="$DATA_FILE"
 echo "Evaluating on train_files"
 
@@ -61,7 +61,7 @@ n_resp_per_prompt_val=$N_VAL
 
 # ================= perfomance =================
 infer_tp=1 # vllm
-train_sp=4 # train
+train_sp=1 # train
 offload=True
 rollout_agent_workers=${ROLLOUT_AGENT_WORKERS:-4}
 rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}
@@ -123,7 +123,7 @@ python3 -m recipe.spo.spo_main_ppo \
     trainer.logger=['console','wandb'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=1 \
     trainer.val_before_train=True \
     trainer.val_only=True \
     trainer.log_val_generations=20 \
