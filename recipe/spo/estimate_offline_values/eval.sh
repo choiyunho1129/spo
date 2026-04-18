@@ -5,6 +5,8 @@ export VLLM_USE_V1=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
 # wandb stability (override if needed)
+export WANDB_API_KEY=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
+export WANDB_ENTITY=riasok
 export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
 export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
 export WANDB_INIT_TIMEOUT=${WANDB_INIT_TIMEOUT:-300}
@@ -12,7 +14,7 @@ export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
 
 # ================= data/model/tool =================
 OUTPUT_DIR=${OUTPUT_DIR:-"spo_verl_pr"}
-DATA_FILE=${DATA_FILE:-"/data1/home/yunhochoi/verl/data/DAPO-Math-17k-Processed_Splits/subset_13_sample50.parquet"}
+DATA_FILE=${DATA_FILE:-"/NHNHOME/WORKSPACE/26msit006_A/kisti/snu/yunhochoi/spo/data/DAPO-Math-17k-Processed_Splits/subset_13.parquet"}
 EXP_NAME=${EXP_NAME:-"offline_value_estimation"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
