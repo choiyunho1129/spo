@@ -121,6 +121,7 @@ ENV/
 *.parquet
 /data/
 /spo_verl_pr/
+/crrl_verl_pr/
 # local logs
 logs
 log

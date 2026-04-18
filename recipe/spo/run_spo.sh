@@ -57,7 +57,7 @@ clip_ratio_high=0.28
 max_turns=1
 max_prompt_length=2048
 max_response_length=$RESPONSE_LENGTH
-actor_lr=2e-6
+actor_lr=1e-6
 
 data_prompt_key=prompt
 filter_overlong_prompts=True

@@ -175,6 +175,7 @@ class DataParallelPPOActor(BasePPOActor):
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+            hidden_capture: pooled prompt/response hidden states for estimator, or None
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -621,7 +622,7 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
+                    entropy, log_prob, _ = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 

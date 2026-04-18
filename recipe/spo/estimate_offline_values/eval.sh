@@ -46,7 +46,7 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 
-max_turns=
+max_turns=1
 max_prompt_length=2048
 max_response_length=$RESPONSE_LENGTH
 actor_lr=1e-6

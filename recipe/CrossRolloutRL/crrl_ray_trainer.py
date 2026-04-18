@@ -978,8 +978,78 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                     )
                                 )
                                 p_hats = p_hats.to(r)
-                                crrl_metrics["crrl/value_predictions"] = value_predictions.mean().detach().item()
-                                crrl_metrics["crrl/cross_rollout_baseline"] = p_hats.mean().detach().item()
+                                value_predictions = value_predictions.to(r)
+                                pair_avg_targets = torch.tensor(
+                                    estimator_training_rows["targets"],
+                                    dtype=torch.float32,
+                                    device=value_predictions.device,
+                                )
+
+                                pred_values = value_predictions.to(torch.float32)
+                                pair_target_errors = pred_values - pair_avg_targets
+                                crrl_metrics["crrl/adaptive_estimator/online_pair_target_mae"] = float(
+                                    pair_target_errors.abs().mean().detach().cpu().item()
+                                )
+                                crrl_metrics["crrl/adaptive_estimator/online_pair_target_rmse"] = float(
+                                    torch.sqrt(torch.mean(pair_target_errors.square())).detach().cpu().item()
+                                )
+                                crrl_metrics["crrl/adaptive_estimator/online_pair_target_bias"] = float(
+                                    pair_target_errors.mean().detach().cpu().item()
+                                )
+
+                                pred_values_np = pred_values.detach().cpu().numpy().astype(np.float32, copy=False)
+                                pair_avg_targets_np = pair_avg_targets.detach().cpu().numpy().astype(np.float32, copy=False)
+                                pred_std = float(pred_values_np.std())
+                                target_std = float(pair_avg_targets_np.std())
+                                if pred_values_np.size > 1 and pred_std > 1e-8 and target_std > 1e-8:
+                                    online_pair_pearson = float(np.corrcoef(pred_values_np, pair_avg_targets_np)[0, 1])
+                                else:
+                                    online_pair_pearson = 0.0
+                                if not np.isfinite(online_pair_pearson):
+                                    online_pair_pearson = 0.0
+                                crrl_metrics["crrl/adaptive_estimator/online_pair_target_pearson"] = online_pair_pearson
+
+                                uid_to_indices_for_metric: dict[str, list[int]] = defaultdict(list)
+                                for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+                                    uid_to_indices_for_metric[str(uid)].append(idx)
+
+                                pairwise_sign_matches: list[float] = []
+                                for _, indices in uid_to_indices_for_metric.items():
+                                    if len(indices) != estimator_pair_size:
+                                        continue
+                                    first_idx, second_idx = indices
+                                    pred_diff = float(
+                                        (value_predictions[first_idx] - value_predictions[second_idx]).detach().cpu().item()
+                                    )
+                                    reward_diff = float((r[first_idx] - r[second_idx]).detach().cpu().item())
+                                    pred_sign = np.sign(pred_diff)
+                                    reward_sign = np.sign(reward_diff)
+                                    pairwise_sign_matches.append(1.0 if pred_sign == reward_sign else 0.0)
+                                if pairwise_sign_matches:
+                                    crrl_metrics["crrl/adaptive_estimator/pairwise_sign_acc"] = float(
+                                        np.mean(pairwise_sign_matches)
+                                    )
+                                else:
+                                    crrl_metrics["crrl/adaptive_estimator/pairwise_sign_acc"] = 0.0
+
+                                reward_var = float(r.to(torch.float32).var(unbiased=False).detach().cpu().item())
+                                adv_var = float(
+                                    raw_advantages.to(torch.float32).var(unbiased=False).detach().cpu().item()
+                                )
+                                if reward_var > 1e-12:
+                                    crrl_metrics["crrl/adaptive_estimator/adv_var_reduction_ratio"] = adv_var / reward_var
+                                else:
+                                    crrl_metrics["crrl/adaptive_estimator/adv_var_reduction_ratio"] = 0.0
+
+                                pred_values_np = value_predictions.detach().cpu().numpy().astype(np.float32, copy=False)
+                                clip_min = float(estimator.config.model.clip_min)
+                                clip_max = float(estimator.config.model.clip_max)
+                                crrl_metrics["crrl/adaptive_estimator/pred_clip_frac_min"] = float(
+                                    np.mean(pred_values_np <= (clip_min + 1e-6))
+                                )
+                                crrl_metrics["crrl/adaptive_estimator/pred_clip_frac_max"] = float(
+                                    np.mean(pred_values_np >= (clip_max - 1e-6))
+                                )
 
                                 estimator_train_prompt_hidden_rows.extend(
                                     estimator_training_rows["prompt_hidden_rows"]
@@ -998,10 +1068,6 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 crrl_metrics["crrl/adaptive_estimator/buffer_rows"] = float(
                                     len(estimator_train_targets)
                                 )
-                                crrl_metrics["crrl/adaptive_estimator/retrain_interval_steps"] = float(
-                                    estimator_retrain_interval_steps
-                                )
-                                crrl_metrics["crrl/adaptive_estimator/retrained_this_step"] = 0.0
 
                                 if estimator_retrain_steps >= estimator_retrain_interval_steps:
                                     if estimator_fit_single_fn is None or estimator_save_bundle_fn is None:
@@ -1063,6 +1129,37 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                     estimator_save_bundle_fn(bundle, model_path)
                                     estimator = load_single_trajectory_estimator(model_path)
 
+                                    train_predictions = np.asarray(
+                                        [
+                                            estimator.predict_value(
+                                                prompt_hidden=prompt_hidden_row,
+                                                response_hidden=response_hidden_row,
+                                                response_features=response_feature_row,
+                                            )
+                                            for prompt_hidden_row, response_hidden_row, response_feature_row in zip(
+                                                estimator_train_prompt_hidden_rows,
+                                                estimator_train_response_hidden_rows,
+                                                estimator_train_response_feature_rows,
+                                                strict=True,
+                                            )
+                                        ],
+                                        dtype=np.float32,
+                                    )
+                                    train_errors = train_predictions - train_target_values
+                                    crrl_metrics["crrl/adaptive_estimator/train_mae"] = float(np.mean(np.abs(train_errors)))
+                                    crrl_metrics["crrl/adaptive_estimator/train_rmse"] = float(
+                                        np.sqrt(np.mean(np.square(train_errors)))
+                                    )
+                                    pred_std = float(train_predictions.std())
+                                    target_std = float(train_target_values.std())
+                                    if train_predictions.size > 1 and pred_std > 1e-8 and target_std > 1e-8:
+                                        pearson = float(np.corrcoef(train_predictions, train_target_values)[0, 1])
+                                    else:
+                                        pearson = 0.0
+                                    if not np.isfinite(pearson):
+                                        pearson = 0.0
+                                    crrl_metrics["crrl/adaptive_estimator/pred_target_pearson"] = pearson
+
                                     retrain_meta = {
                                         "global_step": int(self.global_steps),
                                         "retrain_index": int(retrain_index),
@@ -1078,19 +1175,8 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                         json.dump(retrain_meta, f, ensure_ascii=False, indent=2)
 
                                     estimator_retrain_count = retrain_index
-                                    crrl_metrics["crrl/adaptive_estimator/retrain_count"] = float(estimator_retrain_count)
-                                    crrl_metrics["crrl/adaptive_estimator/retrained_this_step"] = 1.0
-                                    crrl_metrics["crrl/adaptive_estimator/last_train_rows"] = float(
-                                        len(estimator_train_targets)
-                                    )
                                     crrl_metrics["crrl/adaptive_estimator/last_label_mean"] = float(
                                         train_target_values.mean()
-                                    )
-                                    crrl_metrics["crrl/adaptive_estimator/last_label_min"] = float(
-                                        train_target_values.min()
-                                    )
-                                    crrl_metrics["crrl/adaptive_estimator/last_label_max"] = float(
-                                        train_target_values.max()
                                     )
 
                                     estimator_train_prompt_hidden_rows = []
@@ -1166,15 +1252,16 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         metrics.update(actor_output_metrics)
 
                     if self.config.trainer.crrl.enable:
-                        cur_sampled_numbers = []
-                        for prompt in micro_prompts:
-                            prompt2sampled_number[prompt] += 1
-                            cur_sampled_numbers.append(prompt2sampled_number[prompt])
+                        if crrl_weighted_sampling:
+                            cur_sampled_numbers = []
+                            for prompt in micro_prompts:
+                                prompt2sampled_number[prompt] += 1
+                                cur_sampled_numbers.append(prompt2sampled_number[prompt])
 
-                        cur_sampled_numbers = np.array(cur_sampled_numbers, dtype=np.int32)
-                        crrl_metrics["crrl/cur_sampled_number/min"] = cur_sampled_numbers.min()
-                        crrl_metrics["crrl/cur_sampled_number/max"] = cur_sampled_numbers.max()
-                        crrl_metrics["crrl/cur_sampled_number/mean"] = cur_sampled_numbers.mean()
+                            cur_sampled_numbers = np.array(cur_sampled_numbers, dtype=np.int32)
+                            crrl_metrics["crrl/cur_sampled_number/min"] = cur_sampled_numbers.min()
+                            crrl_metrics["crrl/cur_sampled_number/max"] = cur_sampled_numbers.max()
+                            crrl_metrics["crrl/cur_sampled_number/mean"] = cur_sampled_numbers.mean()
 
                         metrics.update(crrl_metrics)
 

@@ -1,5 +1,5 @@
 set -x
-export CUDA_VISIBLE_DEVICES=1,2,3,4
+export CUDA_VISIBLE_DEVICES=3
 export VLLM_USE_V1=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
@@ -11,27 +11,31 @@ export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
 export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
 export WANDB_INIT_TIMEOUT=${WANDB_INIT_TIMEOUT:-300}
 export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
+export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_DIR}/wandb"}
 
+#base config
 OUTPUT_DIR=${OUTPUT_DIR:-"crrl_verl_pr"}
 TRAIN_DATA_DIR=${TRAIN_DATA_DIR:-"data/DAPO-Math-17k-Processed_Splits"}
-EXP_NAME=${EXP_NAME:-"Qwen3-4B_CRRL_batch_1024"}
+EXP_NAME=${EXP_NAME:-"Qwen3-4B_CRRL_batch_256_B200"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
 N_VAL=${N_VAL:-8}
 DEBUG=${DEBUG:-"False"}
+
+#estimator config
 CRRL_MODE=${CRRL_MODE:-"adaptive_estimator"} # non_adaptive_estimator | adaptive_estimator
-BASELINE_VALUES=${BASELINE_VALUES:-"/data1/home/yunhochoi/verl/data/dapo_math_17k_baseline.jsonl"}
+BASELINE_VALUES=${BASELINE_VALUES:-"/NHNHOME/WORKSPACE/26msit006_A/kisti/snu/yunhochoi/crrl/data/dapo_math_17k_baseline.jsonl"}
 ESTIMATOR_MODEL_PATH=${ESTIMATOR_MODEL_PATH:-"recipe/CrossRolloutRL/estimator/artifacts/qwen3_4b_subset3_6_pairavg_estimator.joblib"}
 ESTIMATOR_FEATURE_BUILDER_CONFIG=${ESTIMATOR_FEATURE_BUILDER_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_feature_builder_config.json"}
 ESTIMATOR_FIT_CONFIG=${ESTIMATOR_FIT_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_estimator_fit_config.json"}
 ESTIMATOR_PAIR_SIZE=${ESTIMATOR_PAIR_SIZE:-2}
-ESTIMATOR_RETRAIN_INTERVAL_STEPS=${ESTIMATOR_RETRAIN_INTERVAL_STEPS:-4}
+ESTIMATOR_RETRAIN_INTERVAL_STEPS=${ESTIMATOR_RETRAIN_INTERVAL_STEPS:-2}
 ESTIMATOR_LOG_ROWS_ON_RETRAIN=${ESTIMATOR_LOG_ROWS_ON_RETRAIN:-"True"}
 CRRL_MISSING_PROMPT=${CRRL_MISSING_PROMPT:-"default"} # error | default
 CRRL_DEFAULT_P_HAT=${CRRL_DEFAULT_P_HAT:-0.5}
-CRRL_WEIGHTED_SAMPLING=${CRRL_WEIGHTED_SAMPLING:-"True"}
-export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_DIR}/wandb"}
+CRRL_WEIGHTED_SAMPLING=${CRRL_WEIGHTED_SAMPLING:-"False"}
 
+# dataset 
 train_files="['${TRAIN_DATA_DIR}/all.parquet']"
 AIME_2024_FILE=${AIME_2024_FILE:-"data/AIME_2024.parquet"}
 AIME_2025_FILE=${AIME_2025_FILE:-"data/AIME_2025.parquet"}
@@ -44,12 +48,12 @@ tool_config_path=recipe/CrossRolloutRL/crrl_tool_config.yaml
 agent_loop_config_path=recipe/CrossRolloutRL/config/crrl_agent.yaml
 default_agent_loop=crrl_tool_agent
 
-# wandb
+# file location 
 project_name='ValueEstimator'
 experiment_name=$EXP_NAME
-default_local_dir=$OUTPUT_DIR/$project_name/$experiment_name/checkpoints
-validation_data_dir=$OUTPUT_DIR/$project_name/$experiment_name/validation_data
-ESTIMATOR_ONLINE_OUTPUT_DIR=${ESTIMATOR_ONLINE_OUTPUT_DIR:-"$OUTPUT_DIR/$project_name/$experiment_name/adaptive_estimator"}
+default_local_dir=$OUTPUT_DIR/$experiment_name/checkpoints
+validation_data_dir=$OUTPUT_DIR/$experiment_name/validation_data
+ESTIMATOR_ONLINE_OUTPUT_DIR=${ESTIMATOR_ONLINE_OUTPUT_DIR:-"$OUTPUT_DIR/$experiment_name/adaptive_estimator"}
 
 # ================= algorithm =================
 adv_estimator=grpo
@@ -65,7 +69,7 @@ clip_ratio_high=0.28
 max_turns=1
 max_prompt_length=2048
 max_response_length=$RESPONSE_LENGTH
-actor_lr=2e-6
+actor_lr=1e-6
 
 data_prompt_key=prompt
 filter_overlong_prompts=True
@@ -73,10 +77,10 @@ reward_manager=naive
 
 n_resp_per_prompt=2
 n_resp_per_prompt_val=$N_VAL
-train_batch_size=512
-ppo_mini_batch_size=128
-val_batch_size=128
-gen_batch_size=512 # prompt batch size before rollout repeat
+train_batch_size=128
+ppo_mini_batch_size=64
+val_batch_size=64
+gen_batch_size=128 # prompt batch size before rollout repeat
 crrl_enable=True
 
 # Canonicalize mode and enforce supported options.
@@ -99,16 +103,16 @@ if [ "$max_turns" -eq 1 ]; then
     default_agent_loop=single_turn_agent
 fi
 
-# ================= perfomance =================
+# ================= gpu, vllm config =================
 infer_tp=1 # vllm
-train_sp=4 # train
+train_sp=1 # train
 offload=True
 rollout_agent_workers=${ROLLOUT_AGENT_WORKERS:-4}
-rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
-
+rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64} 
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
 log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
 
+#Vamos! 
 python3 -m recipe.CrossRolloutRL.crrl_main_ppo \
     algorithm.adv_estimator=$adv_estimator \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
@@ -173,7 +177,7 @@ python3 -m recipe.CrossRolloutRL.crrl_main_ppo \
     trainer.nnodes=1 \
     trainer.default_local_dir=$default_local_dir \
     trainer.validation_data_dir=$validation_data_dir \
-    trainer.save_freq=20 \
+    trainer.save_freq=10 \
     trainer.test_freq=10 \
     trainer.total_epochs=500 \
     trainer.crrl.enable=$crrl_enable \
