@@ -1,5 +1,5 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
-# Modifications Copyright 2025 SPO authors
+# Modifications Copyright 2025 CRRL authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .spo_agent_loop import SPOAgentLoopManager
-from .spo_tool_agent_loop import SPOToolAgentLoop
+from .crrl_agent_loop import (
+    CRRLAgentLoopManager,
+)
+from .crrl_tool_agent_loop import (
+    CRRLToolAgentLoop,
+)
 
-__all__ = ["SPOAgentLoopManager", "SPOToolAgentLoop"]
+__all__ = [
+    "CRRLAgentLoopManager",
+    "CRRLToolAgentLoop",
+]

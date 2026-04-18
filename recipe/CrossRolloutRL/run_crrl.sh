@@ -3,26 +3,33 @@ export CUDA_VISIBLE_DEVICES=1,2,3,4
 export VLLM_USE_V1=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+
 # wandb stability (override if needed)
+export WANDB_API_KEY=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
+export WANDB_ENTITY=riasok
 export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
 export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
 export WANDB_INIT_TIMEOUT=${WANDB_INIT_TIMEOUT:-300}
 export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
 
-OUTPUT_DIR=${OUTPUT_DIR:-"spo_verl_pr"}
+OUTPUT_DIR=${OUTPUT_DIR:-"crrl_verl_pr"}
 TRAIN_DATA_DIR=${TRAIN_DATA_DIR:-"data/DAPO-Math-17k-Processed_Splits"}
-EXP_NAME=${EXP_NAME:-"Qwen3-4B_EstimatedValue_SPO_batch_1024"}
+EXP_NAME=${EXP_NAME:-"Qwen3-4B_CRRL_batch_1024"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
 N_VAL=${N_VAL:-8}
-METHOD=${METHOD:-"SPO"}
 DEBUG=${DEBUG:-"False"}
-#OFFLINE_VALUES=${OFFLINE_VALUES:-"DAPO-Math-17k-Processed_Splits/offline_values.json"}
-SPO_MODE=${SPO_MODE:-"baseline_only"} # stateful | baseline_only
+CRRL_MODE=${CRRL_MODE:-"adaptive_estimator"} # non_adaptive_estimator | adaptive_estimator
 BASELINE_VALUES=${BASELINE_VALUES:-"/data1/home/yunhochoi/verl/data/dapo_math_17k_baseline.jsonl"}
-SPO_MISSING_PROMPT=${SPO_MISSING_PROMPT:-"default"} # error | default
-SPO_DEFAULT_P_HAT=${SPO_DEFAULT_P_HAT:-0.5}
-SPO_WEIGHTED_SAMPLING=${SPO_WEIGHTED_SAMPLING:-"True"}
+ESTIMATOR_MODEL_PATH=${ESTIMATOR_MODEL_PATH:-"recipe/CrossRolloutRL/estimator/artifacts/qwen3_4b_subset3_6_pairavg_estimator.joblib"}
+ESTIMATOR_FEATURE_BUILDER_CONFIG=${ESTIMATOR_FEATURE_BUILDER_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_feature_builder_config.json"}
+ESTIMATOR_FIT_CONFIG=${ESTIMATOR_FIT_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_estimator_fit_config.json"}
+ESTIMATOR_PAIR_SIZE=${ESTIMATOR_PAIR_SIZE:-2}
+ESTIMATOR_RETRAIN_INTERVAL_STEPS=${ESTIMATOR_RETRAIN_INTERVAL_STEPS:-4}
+ESTIMATOR_LOG_ROWS_ON_RETRAIN=${ESTIMATOR_LOG_ROWS_ON_RETRAIN:-"True"}
+CRRL_MISSING_PROMPT=${CRRL_MISSING_PROMPT:-"default"} # error | default
+CRRL_DEFAULT_P_HAT=${CRRL_DEFAULT_P_HAT:-0.5}
+CRRL_WEIGHTED_SAMPLING=${CRRL_WEIGHTED_SAMPLING:-"True"}
 export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_DIR}/wandb"}
 
 train_files="['${TRAIN_DATA_DIR}/all.parquet']"
@@ -31,17 +38,18 @@ AIME_2025_FILE=${AIME_2025_FILE:-"data/AIME_2025.parquet"}
 val_files="['${AIME_2024_FILE}', '${AIME_2025_FILE}']"
 
 # tool
-tool_config_path=recipe/spo/spo_tool_config.yaml
+tool_config_path=recipe/CrossRolloutRL/crrl_tool_config.yaml
 
 # agent loop
-agent_loop_config_path=recipe/spo/config/spo_agent.yaml
-default_agent_loop=spo_tool_agent
+agent_loop_config_path=recipe/CrossRolloutRL/config/crrl_agent.yaml
+default_agent_loop=crrl_tool_agent
 
 # wandb
 project_name='ValueEstimator'
 experiment_name=$EXP_NAME
 default_local_dir=$OUTPUT_DIR/$project_name/$experiment_name/checkpoints
 validation_data_dir=$OUTPUT_DIR/$project_name/$experiment_name/validation_data
+ESTIMATOR_ONLINE_OUTPUT_DIR=${ESTIMATOR_ONLINE_OUTPUT_DIR:-"$OUTPUT_DIR/$project_name/$experiment_name/adaptive_estimator"}
 
 # ================= algorithm =================
 adv_estimator=grpo
@@ -63,24 +71,20 @@ data_prompt_key=prompt
 filter_overlong_prompts=True
 reward_manager=naive
 
-N_TRAIN=${N_TRAIN:-8}
-n_resp_per_prompt=$N_TRAIN
+n_resp_per_prompt=2
 n_resp_per_prompt_val=$N_VAL
-if [ "$METHOD" = "GRPO" ]; then
-    train_batch_size=128
-    ppo_mini_batch_size=16
-    val_batch_size=96
-    gen_batch_size=$train_batch_size
-    spo_enable=False
-elif [ "$METHOD" = "SPO" ]; then
-    train_batch_size=1024
-    ppo_mini_batch_size=128
-    val_batch_size=128
-    n_resp_per_prompt=1
-    gen_batch_size=1024 # For DAPO en subsets
-    spo_enable=True
-else
-    echo "Error: METHOD must be either 'GRPO' or 'SPO' when DEBUG is not True"
+train_batch_size=512
+ppo_mini_batch_size=128
+val_batch_size=128
+gen_batch_size=512 # prompt batch size before rollout repeat
+crrl_enable=True
+
+# Canonicalize mode and enforce supported options.
+CRRL_MODE="$(echo "$CRRL_MODE" | tr '[:upper:]' '[:lower:]')"
+if [ "$CRRL_MODE" = "adaptive_estimator" ]; then
+    CRRL_WEIGHTED_SAMPLING=False
+elif [ "$CRRL_MODE" != "non_adaptive_estimator" ]; then
+    echo "Error: CRRL_MODE must be one of 'non_adaptive_estimator' or 'adaptive_estimator'"
     exit 1
 fi
 
@@ -105,7 +109,7 @@ rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
 log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
 
-python3 -m recipe.spo.spo_main_ppo \
+python3 -m recipe.CrossRolloutRL.crrl_main_ppo \
     algorithm.adv_estimator=$adv_estimator \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
     algorithm.kl_ctrl.kl_coef=$kl_coef \
@@ -119,10 +123,10 @@ python3 -m recipe.spo.spo_main_ppo \
     data.max_response_length=$max_response_length \
     data.filter_overlong_prompts=$filter_overlong_prompts \
     data.truncation='error' \
-    data.custom_cls.path=recipe/spo/spo_retool.py \
+    data.custom_cls.path=recipe/CrossRolloutRL/crrl_retool.py \
     data.custom_cls.name=CustomRLHFDataset \
     +data.gen_batch_size=$gen_batch_size \
-    custom_reward_function.path=recipe/spo/spo_retool.py \
+    custom_reward_function.path=recipe/CrossRolloutRL/crrl_retool.py \
     custom_reward_function.name=compute_score \
     reward_model.reward_manager=$reward_manager \
     actor_rollout_ref.model.path=$MODEL_PATH \
@@ -172,11 +176,17 @@ python3 -m recipe.spo.spo_main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=10 \
     trainer.total_epochs=500 \
-    trainer.spo.enable=$spo_enable \
-    trainer.spo.mode=$SPO_MODE \
-    trainer.spo.offline_values=$OFFLINE_VALUES \
-    trainer.spo.baseline_values=$BASELINE_VALUES \
-    trainer.spo.missing_prompt=$SPO_MISSING_PROMPT \
-    trainer.spo.default_p_hat=$SPO_DEFAULT_P_HAT \
-    trainer.spo.weighted_sampling=$SPO_WEIGHTED_SAMPLING \
+    trainer.crrl.enable=$crrl_enable \
+    trainer.crrl.mode=$CRRL_MODE \
+    trainer.crrl.baseline_values=$BASELINE_VALUES \
+    trainer.crrl.missing_prompt=$CRRL_MISSING_PROMPT \
+    trainer.crrl.default_p_hat=$CRRL_DEFAULT_P_HAT \
+    trainer.crrl.weighted_sampling=$CRRL_WEIGHTED_SAMPLING \
+    trainer.crrl.estimator.model_path=$ESTIMATOR_MODEL_PATH \
+    trainer.crrl.estimator.feature_builder_config_path=$ESTIMATOR_FEATURE_BUILDER_CONFIG \
+    trainer.crrl.estimator.fit_config_path=$ESTIMATOR_FIT_CONFIG \
+    trainer.crrl.estimator.pair_size=$ESTIMATOR_PAIR_SIZE \
+    trainer.crrl.estimator.retrain_interval_steps=$ESTIMATOR_RETRAIN_INTERVAL_STEPS \
+    trainer.crrl.estimator.online_output_dir=$ESTIMATOR_ONLINE_OUTPUT_DIR \
+    trainer.crrl.estimator.log_rows_on_retrain=$ESTIMATOR_LOG_ROWS_ON_RETRAIN \
     trainer.debug=$DEBUG  \

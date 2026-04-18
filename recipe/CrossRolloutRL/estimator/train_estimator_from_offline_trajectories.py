@@ -124,7 +124,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("/data1/home/yunhochoi/verl/spo_verl_pr/spo"),
+        default=Path("/data1/home/yunhochoi/verl/crrl_verl_pr/crrl"),
         help="Root directory containing offline_value_estimation_subset_*/validation_data/0.jsonl.",
     )
     parser.add_argument(

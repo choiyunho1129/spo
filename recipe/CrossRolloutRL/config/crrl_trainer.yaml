@@ -1,0 +1,27 @@
+# the crrl config will override default ppo_trainer.yaml
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+trainer:
+  debug: false
+  crrl:
+    enable: False
+    mode: "non_adaptive_estimator"  # non_adaptive_estimator | adaptive_estimator
+    baseline_values: null
+    missing_prompt: "error"  # error | default
+    default_p_hat: 0.5
+    weighted_sampling: True
+    estimator:
+      model_path: null
+      feature_builder_config_path: "recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_feature_builder_config.json"
+      pair_size: 2
+      fit_config_path: "recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_estimator_fit_config.json"
+      retrain_interval_steps: 4
+      online_output_dir: null
+      log_rows_on_retrain: true

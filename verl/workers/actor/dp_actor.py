@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+from typing import Any
 
 import torch
 from torch import nn
@@ -82,10 +83,94 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+        self._last_hidden_capture: dict[str, torch.Tensor] | None = None
+        self._capture_layer_cache: dict[int, nn.Module] = {}
+
+    def _resolve_transformer_layers(self):
+        base_model = self.actor_module
+
+        # unwrap common wrappers (FSDP / DDP / PEFT wrappers)
+        for _ in range(4):
+            next_model = getattr(base_model, "module", None)
+            if next_model is None or next_model is base_model:
+                break
+            base_model = next_model
+
+        if hasattr(base_model, "model") and hasattr(base_model.model, "layers"):
+            return base_model.model.layers
+        if hasattr(base_model, "transformer") and hasattr(base_model.transformer, "h"):
+            return base_model.transformer.h
+        if hasattr(base_model, "gpt_neox") and hasattr(base_model.gpt_neox, "layers"):
+            return base_model.gpt_neox.layers
+        raise ValueError(
+            "Could not resolve transformer layer stack for estimator hidden capture. "
+            "Expected one of model.layers / transformer.h / gpt_neox.layers."
+        )
+
+    def _resolve_capture_layer(self, layer_index: int) -> nn.Module:
+        cached = self._capture_layer_cache.get(layer_index)
+        if cached is not None:
+            return cached
+
+        layers = self._resolve_transformer_layers()
+        if layer_index < 0 or layer_index >= len(layers):
+            raise ValueError(
+                f"Invalid estimator hidden capture layer_index={layer_index} for model with {len(layers)} layers."
+            )
+        layer_module = layers[layer_index]
+        self._capture_layer_cache[layer_index] = layer_module
+        return layer_module
+
+    def _pool_last_n_tokens(self, hidden_tokens: torch.Tensor, n: int, hidden_dim: int) -> torch.Tensor:
+        if hidden_tokens.numel() == 0:
+            return torch.zeros(hidden_dim, device=hidden_tokens.device, dtype=torch.float32)
+        n = max(1, min(int(n), hidden_tokens.size(0)))
+        return hidden_tokens[-n:].mean(dim=0).to(torch.float32)
+
+    def _build_hidden_capture(
+        self,
+        *,
+        full_hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+        response_mask: torch.Tensor | None,
+        response_length: int,
+        prompt_pool_n: int,
+        response_pool_n: int,
+    ) -> dict[str, torch.Tensor]:
+        batch_size, seqlen, hidden_dim = full_hidden.shape
+        prompt_length = seqlen - response_length
+        if prompt_length <= 0:
+            raise ValueError(f"Invalid prompt length while building hidden capture: {prompt_length}")
+
+        prompt_hidden_rows = []
+        response_hidden_rows = []
+
+        for row_idx in range(batch_size):
+            prompt_tokens = full_hidden[row_idx, :prompt_length, :]
+            prompt_valid_mask = attention_mask[row_idx, :prompt_length].bool()
+            prompt_tokens = prompt_tokens[prompt_valid_mask]
+            prompt_hidden_rows.append(self._pool_last_n_tokens(prompt_tokens, prompt_pool_n, hidden_dim))
+
+            response_tokens = full_hidden[row_idx, prompt_length:, :]
+            if response_mask is not None:
+                response_valid_mask = response_mask[row_idx].bool()
+            else:
+                response_valid_mask = attention_mask[row_idx, prompt_length:].bool()
+            response_tokens = response_tokens[response_valid_mask]
+            response_hidden_rows.append(self._pool_last_n_tokens(response_tokens, response_pool_n, hidden_dim))
+
+        return {
+            "prompt_hidden": torch.stack(prompt_hidden_rows, dim=0),
+            "response_hidden": torch.stack(response_hidden_rows, dim=0),
+        }
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy=False,
+        hidden_capture_spec: dict[str, int] | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, dict[str, torch.Tensor] | None]:
         """
         Returns:
             entropy: # (bs, response_len)
@@ -104,6 +189,19 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
+            hidden_capture = None
+
+            layer_hook_handle = None
+            captured_layer_output: dict[str, torch.Tensor] = {}
+            if hidden_capture_spec is not None:
+                capture_layer = self._resolve_capture_layer(int(hidden_capture_spec["layer_index"]))
+
+                def _capture_hidden(_module: nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+                    hidden = output[0] if isinstance(output, tuple) else output
+                    captured_layer_output["hidden"] = hidden
+
+                layer_hook_handle = capture_layer.register_forward_hook(_capture_hidden)
+
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
@@ -219,6 +317,30 @@ class DataParallelPPOActor(BasePPOActor):
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
+
+                captured_hidden_rmpad = None
+                if hidden_capture_spec is not None:
+                    captured_hidden = captured_layer_output.get("hidden")
+                    if captured_hidden is None:
+                        raise RuntimeError(
+                            "Failed to capture hidden states for estimator during compute_log_prob (remove_padding)."
+                        )
+                    if captured_hidden.dim() == 3:
+                        captured_hidden = captured_hidden.squeeze(0)
+                    if captured_hidden.dim() != 2:
+                        raise ValueError(
+                            "Expected captured hidden shape [total_nnz, hidden_dim] in remove_padding path, got "
+                            f"{tuple(captured_hidden.shape)}"
+                        )
+                    captured_hidden_rmpad = captured_hidden
+                    if self.use_ulysses_sp:
+                        captured_hidden_rmpad = gather_outputs_and_unpad(
+                            captured_hidden_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
                     full_entropy = pad_input(
@@ -233,6 +355,21 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
+                if captured_hidden_rmpad is not None:
+                    full_hidden = pad_input(
+                        hidden_states=captured_hidden_rmpad,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    hidden_capture = self._build_hidden_capture(
+                        full_hidden=full_hidden,
+                        attention_mask=attention_mask,
+                        response_mask=micro_batch.get("response_mask"),
+                        response_length=response_length,
+                        prompt_pool_n=int(hidden_capture_spec["prompt_pool_n"]),
+                        response_pool_n=int(hidden_capture_spec["response_pool_n"]),
+                    )
 
                 # only return response part:
                 if calculate_entropy:
@@ -270,7 +407,29 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            return entropy, log_probs
+                if hidden_capture_spec is not None:
+                    captured_hidden = captured_layer_output.get("hidden")
+                    if captured_hidden is None:
+                        raise RuntimeError(
+                            "Failed to capture hidden states for estimator during compute_log_prob (dense path)."
+                        )
+                    if captured_hidden.dim() != 3:
+                        raise ValueError(
+                            f"Expected captured hidden shape [bsz, seqlen, hidden_dim], got {tuple(captured_hidden.shape)}"
+                        )
+                    hidden_capture = self._build_hidden_capture(
+                        full_hidden=captured_hidden,
+                        attention_mask=attention_mask,
+                        response_mask=micro_batch.get("response_mask"),
+                        response_length=response_length,
+                        prompt_pool_n=int(hidden_capture_spec["prompt_pool_n"]),
+                        response_pool_n=int(hidden_capture_spec["response_pool_n"]),
+                    )
+
+            if layer_hook_handle is not None:
+                layer_hook_handle.remove()
+
+            return entropy, log_probs, hidden_capture
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -318,8 +477,18 @@ class DataParallelPPOActor(BasePPOActor):
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        hidden_capture_spec = data.meta_info.get("estimator_hidden_capture")
+        if hidden_capture_spec is not None:
+            hidden_capture_spec = {
+                "layer_index": int(hidden_capture_spec["layer_index"]),
+                "prompt_pool_n": int(hidden_capture_spec["prompt_pool_n"]),
+                "response_pool_n": int(hidden_capture_spec["response_pool_n"]),
+            }
+
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        if hidden_capture_spec is not None and "response_mask" in data.batch.keys():
+            select_keys.append("response_mask")
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -332,28 +501,57 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        prompt_hidden_lst = []
+        response_hidden_lst = []
+        self._last_hidden_capture = None
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                entropy, log_probs, hidden_capture = self._forward_micro_batch(
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    hidden_capture_spec=hidden_capture_spec,
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            if hidden_capture is not None:
+                prompt_hidden_lst.append(hidden_capture["prompt_hidden"])
+                response_hidden_lst.append(hidden_capture["response_hidden"])
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
 
+        prompt_hidden = None
+        response_hidden = None
+        if prompt_hidden_lst:
+            prompt_hidden = torch.concat(prompt_hidden_lst, dim=0)
+            response_hidden = torch.concat(response_hidden_lst, dim=0)
+
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            if prompt_hidden is not None:
+                prompt_hidden = restore_dynamic_batch(prompt_hidden, batch_idx_list)
+                response_hidden = restore_dynamic_batch(response_hidden, batch_idx_list)
+
+        if prompt_hidden is not None:
+            self._last_hidden_capture = {
+                "prompt_hidden": prompt_hidden.to(torch.float32),
+                "response_hidden": response_hidden.to(torch.float32),
+            }
 
         return log_probs, entropys
+
+    def pop_hidden_capture(self) -> dict[str, torch.Tensor] | None:
+        hidden_capture = self._last_hidden_capture
+        self._last_hidden_capture = None
+        return hidden_capture
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):

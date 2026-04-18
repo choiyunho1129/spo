@@ -1,5 +1,5 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
-# Modifications Copyright 2025 SPO authors
+# Modifications Copyright 2025 CRRL authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-SPO main PPO training entry point.
-This module extends the base PPO trainer with SPO-specific logic.
+CRRL main PPO training entry point.
+This module extends the base PPO trainer with CRRL-specific logic.
 """
 
 import os
@@ -23,7 +23,7 @@ import socket
 import hydra
 import ray
 from omegaconf import OmegaConf
-from recipe.spo.spo_ray_trainer import RayPPOTrainer
+from recipe.CrossRolloutRL.crrl_ray_trainer import RayPPOTrainer
 
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.main_ppo import TaskRunner as BaseTaskRunner
@@ -34,7 +34,7 @@ from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
 
 
-@hydra.main(config_path="config", config_name="spo_trainer", version_base=None)
+@hydra.main(config_path="config", config_name="crrl_trainer", version_base=None)
 def main(config):
     """Main entry point for PPO training with Hydra configuration management.
 
@@ -61,7 +61,7 @@ def run_ppo(config, task_runner_class=None) -> None:
         # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
         # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
         default_runtime_env = get_ppo_ray_runtime_env()
-        # SPO-specific debug logic: Enable Ray debug mode for legacy debugging
+        # CRRL-specific debug logic: Enable Ray debug mode for legacy debugging
         if config.trainer.debug:
             default_runtime_env["env_vars"]["RAY_DEBUG"] = "legacy"
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
@@ -108,16 +108,16 @@ def run_ppo(config, task_runner_class=None) -> None:
 
 
 class TaskRunner(BaseTaskRunner):
-    """SPO-specific TaskRunner extending base implementation.
+    """CRRL-specific TaskRunner extending base implementation.
 
     Inherits most functionality from base TaskRunner and only overrides methods
-    that need to import from recipe.spo.spo_ray_trainer instead of verl.trainer.ppo.ray_trainer.
+    that need to import from recipe.CrossRolloutRL.crrl_ray_trainer instead of verl.trainer.ppo.ray_trainer.
     """
 
     def add_actor_rollout_worker(self, config):
-        """Override: Add actor rollout worker with SPO Role import.
+        """Override: Add actor rollout worker with CRRL Role import.
 
-        SPO modification: Imports Role from recipe.spo.spo_ray_trainer
+        CRRL modification: Imports Role from recipe.CrossRolloutRL.crrl_ray_trainer
         instead of verl.trainer.ppo.ray_trainer.
         """
         from verl.single_controller.ray import RayWorkerGroup
@@ -151,16 +151,16 @@ class TaskRunner(BaseTaskRunner):
         else:
             raise NotImplementedError
 
-        from recipe.spo.spo_ray_trainer import Role
+        from recipe.CrossRolloutRL.crrl_ray_trainer import Role
 
         self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
 
         return actor_rollout_cls, ray_worker_group_cls
 
     def add_critic_worker(self, config):
-        """Override: Add critic worker with SPO Role import.
+        """Override: Add critic worker with CRRL Role import.
 
-        SPO modification: Imports Role from recipe.spo.spo_ray_trainer
+        CRRL modification: Imports Role from recipe.CrossRolloutRL.crrl_ray_trainer
         instead of verl.trainer.ppo.ray_trainer.
         """
         if config.critic.strategy in {"fsdp", "fsdp2"}:
@@ -180,17 +180,17 @@ class TaskRunner(BaseTaskRunner):
         else:
             raise NotImplementedError
 
-        from recipe.spo.spo_ray_trainer import Role
+        from recipe.CrossRolloutRL.crrl_ray_trainer import Role
 
         self.role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
 
     def init_resource_pool_mgr(self, config):
-        """Override: Initialize resource pool manager with SPO imports.
+        """Override: Initialize resource pool manager with CRRL imports.
 
-        SPO modification: Imports Role and ResourcePoolManager from
-        recipe.spo.spo_ray_trainer instead of verl.trainer.ppo.ray_trainer.
+        CRRL modification: Imports Role and ResourcePoolManager from
+        recipe.CrossRolloutRL.crrl_ray_trainer instead of verl.trainer.ppo.ray_trainer.
         """
-        from recipe.spo.spo_ray_trainer import Role
+        from recipe.CrossRolloutRL.crrl_ray_trainer import Role
 
         global_pool_id = "global_pool"
         resource_pool_spec = {
@@ -208,18 +208,18 @@ class TaskRunner(BaseTaskRunner):
 
         self.mapping[Role.ActorRollout] = global_pool_id
         self.mapping[Role.Critic] = global_pool_id
-        from recipe.spo.spo_ray_trainer import ResourcePoolManager
+        from recipe.CrossRolloutRL.crrl_ray_trainer import ResourcePoolManager
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
         return resource_pool_manager
 
     def add_reward_model_worker(self, config):
-        """Override: Add reward model worker with SPO Role import.
+        """Override: Add reward model worker with CRRL Role import.
 
-        SPO modification: Imports Role from recipe.spo.spo_ray_trainer
+        CRRL modification: Imports Role from recipe.CrossRolloutRL.crrl_ray_trainer
         instead of verl.trainer.ppo.ray_trainer.
         """
-        from recipe.spo.spo_ray_trainer import Role
+        from recipe.CrossRolloutRL.crrl_ray_trainer import Role
 
         if config.reward_model.enable:
             use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
@@ -244,12 +244,12 @@ class TaskRunner(BaseTaskRunner):
                 self.mapping[Role.RewardModel] = "global_pool"
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
-        """Override: Add reference policy worker with SPO Role import.
+        """Override: Add reference policy worker with CRRL Role import.
 
-        SPO modification: Imports Role from recipe.spo.spo_ray_trainer
+        CRRL modification: Imports Role from recipe.CrossRolloutRL.crrl_ray_trainer
         instead of verl.trainer.ppo.ray_trainer.
         """
-        from recipe.spo.spo_ray_trainer import Role
+        from recipe.CrossRolloutRL.crrl_ray_trainer import Role
 
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)

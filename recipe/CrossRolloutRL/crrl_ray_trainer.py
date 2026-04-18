@@ -1,7 +1,7 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 # Copyright 2023-2024 SGLang Team
 # Copyright 2025 ModelBest Inc. and/or its affiliates
-# Modifications Copyright 2025 SPO authors
+# Modifications Copyright 2025 CRRL authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,13 +15,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-SPO Trainer extending PPO Trainer with Self-Play Optimization.
-This trainer inherits from the base PPO trainer and adds SPO-specific logic.
+CRRL Trainer extending PPO Trainer with Self-Play Optimization.
+This trainer inherits from the base PPO trainer and adds CRRL-specific logic.
 """
 
 import json
 import os
-import random
+import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -57,7 +57,6 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
-from verl.utils.torch_functional import masked_mean
 
 # Re-export for backward compatibility
 __all__ = [
@@ -71,13 +70,15 @@ __all__ = [
 
 
 class RayPPOTrainer(BaseRayPPOTrainer):
-    """SPO-specific PPO trainer that extends the base trainer with Self-Play Optimization logic.
+    """CRRL-specific PPO trainer that extends the base trainer with Self-Play Optimization logic.
 
     This trainer inherits most functionality from the base RayPPOTrainer and adds:
-    - SPO-specific weighted sampling based on Thompson sampling
-    - SPO advantage calculation using Bayesian framework
-    - Alpha/beta updates with KL-based rho smoothing
+    - CRRL-specific weighted sampling based on Thompson sampling
+    - CRRL advantage calculation with external baseline or value estimation
     """
+
+    _THINK_CONTENT_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.IGNORECASE | re.DOTALL)
+    _ANSWER_CONTENT_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -109,9 +110,9 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         print(f"Dumped generations to {filename}")
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        """Override: Get generation batch with SPO-specific keys.
+        """Override: Get generation batch with CRRL-specific keys.
 
-        SPO modification: Includes "raw_prompt" in reward_model_keys.
+        CRRL modification: Includes "raw_prompt" in reward_model_keys.
         """
         reward_model_keys = (
             set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()
@@ -231,79 +232,237 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
-            from recipe.spo.agent_loop import SPOAgentLoopManager
+            from recipe.CrossRolloutRL.agent_loop import CRRLAgentLoopManager
 
             self.async_rollout_mode = True
-            self.async_rollout_manager = SPOAgentLoopManager(
+            self.async_rollout_manager = CRRLAgentLoopManager(
                 config=self.config, worker_group=self.actor_rollout_wg, rm_wg=self.rm_wg
             )
 
-    def _get_spo_rho(
+    @staticmethod
+    def _extract_prompt_text(raw_prompt_item) -> str:
+        if isinstance(raw_prompt_item, str):
+            return raw_prompt_item.strip()
+        if isinstance(raw_prompt_item, dict):
+            return str(raw_prompt_item.get("content", "")).strip()
+        if isinstance(raw_prompt_item, list | tuple) and raw_prompt_item:
+            first_turn = raw_prompt_item[0]
+            if isinstance(first_turn, dict):
+                return str(first_turn.get("content", "")).strip()
+            return str(first_turn).strip()
+        return str(raw_prompt_item).strip()
+
+    @staticmethod
+    def _span_to_token_indices(offsets: list[tuple[int, int]], span: tuple[int, int] | None) -> list[int]:
+        if span is None:
+            return []
+        span_start, span_end = span
+        indices = []
+        for idx, (tok_start, tok_end) in enumerate(offsets):
+            if tok_end <= span_start or tok_start >= span_end:
+                continue
+            if tok_end > tok_start:
+                indices.append(idx)
+        return indices
+
+    @staticmethod
+    def _mean_at_indices(values: np.ndarray, indices: list[int]) -> float:
+        if not indices or values.size == 0:
+            return 0.0
+        clipped = [idx for idx in indices if 0 <= idx < values.shape[0]]
+        if not clipped:
+            return 0.0
+        return float(values[clipped].mean())
+
+    def _find_reasoning_answer_spans(self, text: str) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+        reasoning_span = None
+        answer_span = None
+
+        think_match = self._THINK_CONTENT_PATTERN.search(text)
+        if think_match:
+            reasoning_span = (think_match.start(1), think_match.end(1))
+
+        answer_match = self._ANSWER_CONTENT_PATTERN.search(text)
+        if answer_match:
+            answer_span = (answer_match.start(1), answer_match.end(1))
+        elif "</think>" in text:
+            start = text.find("</think>") + len("</think>")
+            end = len(text)
+            while start < end and text[start].isspace():
+                start += 1
+            while end > start and text[end - 1].isspace():
+                end -= 1
+            if end > start:
+                answer_span = (start, end)
+
+        return reasoning_span, answer_span
+
+    def _fallback_segment_indices(
+        self, generated_text: str, total_tokens: int
+    ) -> tuple[list[int], list[int]]:
+        from recipe.CrossRolloutRL.estimator.single_trajectory_estimator_support.feature_builder.features import (
+            extract_reasoning_and_answer,
+        )
+
+        _, reasoning_text, answer_text = extract_reasoning_and_answer({"generated_text": generated_text})
+        reasoning_count = len(self.tokenizer.encode(reasoning_text, add_special_tokens=False)) if reasoning_text else 0
+        answer_count = len(self.tokenizer.encode(answer_text, add_special_tokens=False)) if answer_text else 0
+
+        reasoning_count = min(reasoning_count, total_tokens)
+        answer_count = min(answer_count, total_tokens)
+        reasoning_indices = list(range(reasoning_count))
+        answer_indices = list(range(max(0, total_tokens - answer_count), total_tokens))
+        return reasoning_indices, answer_indices
+
+    def _compute_rollout_entropy_features(
         self,
-        prompt2protodata: dict[str, DataProto],
-        prompt2log_probs: dict[str, torch.Tensor],
-        prompt2D: dict[str, torch.Tensor],
-        micro_prompts: list[str],
-        spo_log_prob_batch_backup: DataProto,
-    ) -> torch.Tensor:
-        """Calculate rho for alpha and beta updating."""
-        rho_metrics = {}
+        *,
+        generated_text: str,
+        response_ids: list[int],
+        response_entropies: np.ndarray,
+    ) -> dict[str, float]:
+        output_mean = float(response_entropies.mean()) if response_entropies.size > 0 else 0.0
+        reasoning_mean = 0.0
+        answer_mean = 0.0
 
-        if self.config.trainer.spo.rho.type == "constant":
-            # Repeat a constant to len(micro_prompts) as a torch.Tensor
-            rho = torch.full((len(micro_prompts),), self.config.trainer.spo.rho.value, dtype=torch.float32)
-            D = torch.full((len(micro_prompts),), 0.0, dtype=torch.float32)
-            rho_metrics["spo/rho"] = rho.mean().item()
-            rho_metrics["spo/D"] = D.mean().item()
-            return rho, prompt2protodata, prompt2log_probs, prompt2D, rho_metrics
-        elif self.config.trainer.spo.rho.type == "kl":
-            # Extract past dataprotos of micro_prompts
-            past_dataprotos = []
-            first_sampled_number = 0
-            for pid_, p_ in enumerate(micro_prompts):
-                if p_ in prompt2protodata.keys():
-                    proto = prompt2protodata[p_]
-                else:
-                    first_sampled_number += 1
-                    proto = spo_log_prob_batch_backup.select_idxs([pid_])
-                # Remove per-sample meta_info fields to avoid conflicts during concat
-                proto.meta_info.pop("global_token_num", None)
-                past_dataprotos.append(proto)
-            past_dataprotos = DataProto.concat(past_dataprotos)
-            response_mask = compute_response_mask(past_dataprotos)
-            first_sampled_ratio = first_sampled_number / len(micro_prompts)
-            rho_metrics["spo/first_sampled_ratio"] = first_sampled_ratio
+        reasoning_indices: list[int] = []
+        answer_indices: list[int] = []
+        use_offset_fallback = False
 
-            cur_log_probs = self.actor_rollout_wg.compute_log_prob(past_dataprotos)
-            cur_log_probs = cur_log_probs.batch["old_log_probs"]
-            old_log_probs = []
-            for pid_, p_ in enumerate(micro_prompts):
-                if p_ in prompt2log_probs.keys():
-                    old_log_probs.append(prompt2log_probs[p_])
-                else:
-                    old_log_probs.append(cur_log_probs[pid_].unsqueeze(0))
-            old_log_probs = torch.cat(old_log_probs, dim=0)  # (M, seq_len)
+        try:
+            encoded = self.tokenizer(generated_text, add_special_tokens=False, return_offsets_mapping=True)
+            token_ids_by_offset = encoded["input_ids"]
+            offsets = encoded["offset_mapping"]
+            if token_ids_by_offset and isinstance(token_ids_by_offset[0], list):
+                token_ids_by_offset = token_ids_by_offset[0]
+            if offsets and isinstance(offsets[0], list):
+                offsets = offsets[0]
+            offsets = [(int(start), int(end)) for start, end in offsets]
 
-            kl = (old_log_probs - cur_log_probs).abs()
-            D = masked_mean(kl, response_mask, axis=-1)  # (M,)
-            rho_metrics["spo/D"] = D.mean().item()
-            D_half = torch.as_tensor(0.06, dtype=D.dtype, device=D.device)
-            rho = torch.pow(2.0, -D / D_half)
-            rho_metrics["spo/rho"] = rho.mean().item()
-            rho_clipped = torch.clamp(rho, min=self.config.trainer.spo.rho.clip_lower, max=0.96)
-            rho_metrics["spo/rho_clipped"] = rho_clipped.mean().item()
-            rho_metrics["spo/rho_clip_ratio"] = (rho_clipped != rho).type(torch.float).mean().item()
+            if len(token_ids_by_offset) != len(response_ids):
+                use_offset_fallback = True
+            else:
+                reasoning_span, answer_span = self._find_reasoning_answer_spans(generated_text)
+                reasoning_indices = self._span_to_token_indices(offsets, reasoning_span)
+                answer_indices = self._span_to_token_indices(offsets, answer_span)
+        except Exception:
+            use_offset_fallback = True
 
-            # Update prompt2protodata and prompt2log_probs
-            new_log_probs = self.actor_rollout_wg.compute_log_prob(spo_log_prob_batch_backup)
-            for pid_, p_ in enumerate(micro_prompts):
-                prompt2protodata[p_] = spo_log_prob_batch_backup.select_idxs([pid_])
-                prompt2log_probs[p_] = new_log_probs.batch["old_log_probs"][pid_].unsqueeze(0)
-                prompt2D[p_] = D[pid_].item()
+        if use_offset_fallback:
+            reasoning_indices, answer_indices = self._fallback_segment_indices(generated_text, len(response_ids))
 
-            return rho_clipped, prompt2protodata, prompt2log_probs, prompt2D, rho_metrics
-        else:
-            raise ValueError(f"Unknown rho type: {self.config.trainer.spo.rho.type}")
+        reasoning_mean = self._mean_at_indices(response_entropies, reasoning_indices)
+        answer_mean = self._mean_at_indices(response_entropies, answer_indices)
+        return {
+            "output_mean_token_entropy": output_mean,
+            "reasoning_mean_token_entropy": reasoning_mean,
+            "answer_mean_token_entropy": answer_mean,
+        }
+
+    def _compute_estimator_cross_rollout_advantages(
+        self,
+        *,
+        batch: DataProto,
+        reward_sums: torch.Tensor,
+        token_entropys: torch.Tensor,
+        estimator,
+        feature_builder,
+        pair_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, list]]:
+        if pair_size != 2:
+            raise ValueError(f"Estimator cross-rollout advantage currently requires pair_size=2, got {pair_size}.")
+
+        prompt_hidden_key = "estimator_prompt_hidden"
+        response_hidden_key = "estimator_response_hidden"
+
+        if prompt_hidden_key not in batch.batch.keys() or response_hidden_key not in batch.batch.keys():
+            raise KeyError(
+                "Estimator hidden features are missing in batch. "
+                f"Expected '{prompt_hidden_key}' and '{response_hidden_key}'."
+            )
+
+        if "uid" not in batch.non_tensor_batch:
+            raise KeyError("Cross-rollout estimator advantage requires non_tensor field 'uid'.")
+
+        batch_size = len(batch.batch)
+        value_predictions = torch.zeros(batch_size, dtype=torch.float32)
+        prompt_hidden_rows: list[np.ndarray] = []
+        response_hidden_rows: list[np.ndarray] = []
+        response_feature_rows: list[dict[str, float]] = []
+        response_masks = batch.batch["response_mask"]
+        response_tokens = batch.batch["responses"]
+        raw_prompts = batch.non_tensor_batch.get("raw_prompt")
+
+        for idx in range(batch_size):
+            valid_mask = response_masks[idx].bool().detach().cpu()
+            valid_response_ids = response_tokens[idx].detach().cpu()[valid_mask].tolist()
+            generated_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            entropy_values = token_entropys[idx].detach().cpu()[valid_mask].numpy()
+            rollout_features = self._compute_rollout_entropy_features(
+                generated_text=generated_text,
+                response_ids=valid_response_ids,
+                response_entropies=entropy_values,
+            )
+
+            prompt_hidden_raw = batch.batch[prompt_hidden_key][idx].detach().cpu().numpy()
+            response_hidden_raw = batch.batch[response_hidden_key][idx].detach().cpu().numpy()
+
+            reasoning_content = ""
+            answer_content = ""
+            if raw_prompts is not None:
+                prompt_text = self._extract_prompt_text(raw_prompts[idx])
+                if prompt_text and generated_text.startswith(prompt_text):
+                    generated_text = generated_text[len(prompt_text) :]
+                generated_text = generated_text.strip()
+
+            prompt_hidden, response_hidden, response_features = feature_builder.build_inputs(
+                prompt_hidden_layers=prompt_hidden_raw,
+                response_hidden_layers=response_hidden_raw,
+                generated_text=generated_text,
+                response_ids=valid_response_ids,
+                tokenizer=self.tokenizer,
+                reasoning_content=reasoning_content,
+                answer_content=answer_content,
+                rollout_features=rollout_features,
+            )
+            prompt_hidden_rows.append(np.asarray(prompt_hidden, dtype=np.float32).reshape(-1))
+            response_hidden_rows.append(np.asarray(response_hidden, dtype=np.float32).reshape(-1))
+            response_feature_rows.append({k: float(v) for k, v in response_features.items()})
+            value_predictions[idx] = float(
+                estimator.predict_value(
+                    prompt_hidden=prompt_hidden,
+                    response_hidden=response_hidden,
+                    response_features=response_features,
+                )
+            )
+
+        uid_to_indices: dict[str, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+            uid_to_indices[str(uid)].append(idx)
+
+        cross_baselines = torch.zeros_like(value_predictions)
+        target_tensor = torch.zeros(batch_size, dtype=torch.float32)
+        for uid, indices in uid_to_indices.items():
+            if len(indices) != pair_size:
+                raise ValueError(
+                    "Cross-rollout estimator advantage requires each uid to appear exactly twice. "
+                    f"uid={uid}, count={len(indices)}."
+                )
+            first_idx, second_idx = indices
+            cross_baselines[first_idx] = value_predictions[second_idx]
+            cross_baselines[second_idx] = value_predictions[first_idx]
+            pair_avg_target = float(reward_sums[indices].to(torch.float32).mean().detach().cpu().item())
+            target_tensor[first_idx] = pair_avg_target
+            target_tensor[second_idx] = pair_avg_target
+
+        raw_advantages = reward_sums.to(torch.float32) - cross_baselines.to(torch.float32)
+        training_rows = {
+            "prompt_hidden_rows": prompt_hidden_rows,
+            "response_hidden_rows": response_hidden_rows,
+            "response_feature_rows": response_feature_rows,
+            "targets": target_tensor.tolist(),
+        }
+        return raw_advantages, cross_baselines, value_predictions, training_rows
 
     def fit(self):
         """
@@ -359,58 +518,59 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         )
         next_step_profile = False
 
-        spo_mode = "stateful"
-        spo_missing_prompt = "error"
-        spo_default_p_hat = 0.5
-        spo_weighted_sampling = True
+        crrl_mode = "non_adaptive_estimator"
+        crrl_missing_prompt = "error"
+        crrl_default_p_hat = 0.5
+        crrl_weighted_sampling = True
         full_prompts = []
-        prompt2alpha = {}
-        prompt2beta = {}
-        prompt2protodata = {}
-        prompt2log_probs = {}
-        prompt2D = {}
         prompt2baseline = {}
         prompt2sampled_number = defaultdict(int)
+        estimator_enabled = False
+        estimator = None
+        estimator_feature_builder = None
+        estimator_feature_builder_config = None
+        estimator_fit_config = None
+        estimator_fit_single_fn = None
+        estimator_save_bundle_fn = None
+        estimator_pair_size = 2
+        estimator_capture_spec = None
+        estimator_retrain_interval_steps = 4
+        estimator_retrain_output_dir = None
+        estimator_log_rows_on_retrain = True
+        estimator_retrain_steps = 0
+        estimator_retrain_count = 0
+        estimator_train_prompt_hidden_rows: list[np.ndarray] = []
+        estimator_train_response_hidden_rows: list[np.ndarray] = []
+        estimator_train_response_feature_rows: list[dict[str, float]] = []
+        estimator_train_targets: list[float] = []
 
-        if self.config.trainer.spo.enable:
-            spo_mode = str(self.config.trainer.spo.get("mode", "stateful")).lower()
-            if spo_mode not in {"stateful", "baseline_only"}:
-                raise ValueError(f"Unknown trainer.spo.mode: {spo_mode}. Expected one of stateful, baseline_only.")
-
-            spo_missing_prompt = str(self.config.trainer.spo.get("missing_prompt", "error")).lower()
-            if spo_missing_prompt not in {"error", "default"}:
+        if self.config.trainer.crrl.enable:
+            crrl_mode = str(self.config.trainer.crrl.get("mode", "non_adaptive_estimator")).lower()
+            if crrl_mode not in {"non_adaptive_estimator", "adaptive_estimator"}:
                 raise ValueError(
-                    f"Unknown trainer.spo.missing_prompt: {spo_missing_prompt}. Expected one of error, default."
+                    f"Unknown trainer.crrl.mode: {crrl_mode}. "
+                    "Expected one of non_adaptive_estimator, adaptive_estimator."
                 )
 
-            spo_default_p_hat = float(self.config.trainer.spo.get("default_p_hat", 0.5))
-            if not (0.0 <= spo_default_p_hat <= 1.0):
-                raise ValueError(f"trainer.spo.default_p_hat must be in [0, 1], got: {spo_default_p_hat}")
+            crrl_missing_prompt = str(self.config.trainer.crrl.get("missing_prompt", "error")).lower()
+            if crrl_missing_prompt not in {"error", "default"}:
+                raise ValueError(
+                    f"Unknown trainer.crrl.missing_prompt: {crrl_missing_prompt}. Expected one of error, default."
+                )
 
-            spo_weighted_sampling = bool(self.config.trainer.spo.get("weighted_sampling", True))
+            crrl_default_p_hat = float(self.config.trainer.crrl.get("default_p_hat", 0.5))
+            if not (0.0 <= crrl_default_p_hat <= 1.0):
+                raise ValueError(f"trainer.crrl.default_p_hat must be in [0, 1], got: {crrl_default_p_hat}")
 
-            if spo_mode == "stateful":
-                prompt2scores = json.load(open(self.config.trainer.spo.offline_values))
-                Neff = self.config.trainer.spo.offline_N
-                prompt2scores = {k: [int(_ > 0) for _ in v] for k, v in prompt2scores.items()}
-                print(f"[DEBUG] Select {Neff} samples for each prompt to calculate offline values.")
-                full_prompts = list(prompt2scores.keys())
-                if Neff == 0:
-                    prompt2alpha = {k: 0.5 for k in full_prompts}
-                    prompt2beta = {k: 0.5 for k in full_prompts}
-                else:
-                    for k, v in prompt2scores.items():
-                        if len(v) > Neff:
-                            prompt2scores[k] = random.sample(v, Neff)
-                    N_init = 1 / (1 - self.config.trainer.spo.rho.clip_lower)
-                    print(f"[DEBUG] N_init: {N_init}")
-                    prompt2alpha = {k: N_init * (sum(prompt2scores[k]) + 0.5) / (Neff + 1) for k in full_prompts}
-                    prompt2beta = {k: N_init * (Neff - sum(prompt2scores[k]) + 0.5) / (Neff + 1) for k in full_prompts}
-            else:
-                baseline_values_path = self.config.trainer.spo.get("baseline_values", None)
+            crrl_weighted_sampling = bool(self.config.trainer.crrl.get("weighted_sampling", True))
+            estimator_enabled = crrl_mode == "adaptive_estimator"
+
+            if crrl_mode == "non_adaptive_estimator":
+                baseline_values_path = self.config.trainer.crrl.get("baseline_values", None)
                 if not baseline_values_path:
                     raise ValueError(
-                        "trainer.spo.baseline_values must be provided when trainer.spo.mode='baseline_only'."
+                        "trainer.crrl.baseline_values must be provided when "
+                        "trainer.crrl.mode='non_adaptive_estimator'."
                     )
 
                 prompt2baseline = {}
@@ -480,26 +640,112 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                 full_prompts = list(prompt2baseline.keys())
                 print(
                     f"[DEBUG] Loaded {len(prompt2baseline)} baseline prompts from "
-                    f"trainer.spo.baseline_values={baseline_values_path}"
+                    f"trainer.crrl.baseline_values={baseline_values_path}"
+                )
+            else:
+                if crrl_weighted_sampling:
+                    raise ValueError(
+                        "trainer.crrl.weighted_sampling must be False when "
+                        "trainer.crrl.mode='adaptive_estimator'."
+                    )
+                crrl_estimator_cfg = self.config.trainer.crrl.get("estimator", None)
+                if crrl_estimator_cfg is None:
+                    crrl_estimator_cfg = {}
+
+                if self.config.actor_rollout_ref.actor.strategy not in {"fsdp", "fsdp2"}:
+                    raise NotImplementedError(
+                        "trainer.crrl.estimator currently supports actor strategy in {'fsdp', 'fsdp2'} only."
+                    )
+                from recipe.CrossRolloutRL.estimator.single_trajectory_estimator import (
+                    FeatureBuilderConfig,
+                    SingleTrajectoryEstimatorFitConfig,
+                    SingleTrajectoryFeatureBuilder,
+                    fit_single_trajectory_estimator,
+                    load_single_trajectory_estimator,
+                    save_single_trajectory_estimator_bundle,
+                )
+
+                estimator_model_path = crrl_estimator_cfg.get("model_path", None)
+                if not estimator_model_path:
+                    raise ValueError(
+                        "trainer.crrl.estimator.model_path must be set when trainer.crrl.mode='adaptive_estimator'."
+                    )
+                estimator = load_single_trajectory_estimator(estimator_model_path)
+
+                feature_builder_config_path = crrl_estimator_cfg.get(
+                    "feature_builder_config_path",
+                    "recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_feature_builder_config.json",
+                )
+                with open(feature_builder_config_path, encoding="utf-8") as f:
+                    feature_builder_payload = json.load(f)
+                feature_builder_config = FeatureBuilderConfig.from_dict(feature_builder_payload)
+                estimator_feature_builder = SingleTrajectoryFeatureBuilder(feature_builder_config)
+                estimator_feature_builder_config = feature_builder_config
+                estimator_pair_size = int(crrl_estimator_cfg.get("pair_size", 2))
+                estimator_retrain_interval_steps = int(crrl_estimator_cfg.get("retrain_interval_steps", 4))
+                if estimator_retrain_interval_steps <= 0:
+                    raise ValueError(
+                        "trainer.crrl.estimator.retrain_interval_steps must be a positive integer, "
+                        f"got {estimator_retrain_interval_steps}."
+                    )
+
+                fit_config_path = crrl_estimator_cfg.get(
+                    "fit_config_path",
+                    "recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_estimator_fit_config.json",
+                )
+                with open(fit_config_path, encoding="utf-8") as f:
+                    fit_payload = json.load(f)
+                estimator_fit_config = SingleTrajectoryEstimatorFitConfig(**fit_payload)
+                estimator_fit_single_fn = fit_single_trajectory_estimator
+                estimator_save_bundle_fn = save_single_trajectory_estimator_bundle
+
+                estimator_retrain_output_dir = crrl_estimator_cfg.get("online_output_dir", None)
+                if not estimator_retrain_output_dir:
+                    estimator_retrain_output_dir = os.path.join(
+                        str(self.config.trainer.default_local_dir), "adaptive_estimator"
+                    )
+                estimator_log_rows_on_retrain = bool(crrl_estimator_cfg.get("log_rows_on_retrain", True))
+
+                if feature_builder_config.prompt_hidden.layer_index != feature_builder_config.response_hidden.layer_index:
+                    raise ValueError(
+                        "trainer.crrl.estimator currently requires prompt/response hidden layer_index to match."
+                    )
+                if feature_builder_config.prompt_hidden.pooling.type != "last_n_mean":
+                    raise ValueError("trainer.crrl.estimator expects prompt_hidden.pooling.type='last_n_mean'.")
+                if feature_builder_config.response_hidden.pooling.type != "last_n_mean":
+                    raise ValueError("trainer.crrl.estimator expects response_hidden.pooling.type='last_n_mean'.")
+
+                estimator_capture_spec = {
+                    "layer_index": int(feature_builder_config.prompt_hidden.layer_index),
+                    "prompt_pool_n": int(feature_builder_config.prompt_hidden.pooling.n),
+                    "response_pool_n": int(feature_builder_config.response_hidden.pooling.n),
+                }
+                rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+                if rollout_n != estimator_pair_size:
+                    raise ValueError(
+                        "Cross-rollout estimator requires actor_rollout_ref.rollout.n == "
+                        f"trainer.crrl.estimator.pair_size. Got n={rollout_n}, pair_size={estimator_pair_size}."
+                    )
+
+                full_prompts = []
+                print(
+                    "[DEBUG] Enabled CRRL estimator baseline: "
+                    f"model={estimator_model_path}, pair_size={estimator_pair_size}, "
+                    f"hidden_source=pi_theta, retrain_interval_steps={estimator_retrain_interval_steps}, "
+                    f"online_output_dir={estimator_retrain_output_dir}"
                 )
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
-                if self.config.trainer.spo.enable and spo_weighted_sampling:
+                if self.config.trainer.crrl.enable and crrl_weighted_sampling:
                     EXPLORATION_EPSILON = 0.05
-
-                    if spo_mode == "stateful":
-                        prompt2phat = {
-                            k: float(prompt2alpha[k]) / float(prompt2alpha[k] + prompt2beta[k]) for k in full_prompts
-                        }
-                    else:
-                        prompt2phat = prompt2baseline
+                    prompt2phat = prompt2baseline
 
                     prompt2weight = {
                         k: ((prompt2phat[k] * (1.0 - prompt2phat[k])) ** 0.5) + EXPLORATION_EPSILON
                         for k in full_prompts
                     }
-                    default_weight = ((spo_default_p_hat * (1.0 - spo_default_p_hat)) ** 0.5) + EXPLORATION_EPSILON
+                    default_weight = ((crrl_default_p_hat * (1.0 - crrl_default_p_hat)) ** 0.5) + EXPLORATION_EPSILON
 
                     items = []
                     weights = []
@@ -507,11 +753,11 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         p_str = p[0]["content"].strip()
                         if p_str in prompt2weight:
                             w = float(prompt2weight[p_str])
-                        elif spo_missing_prompt == "default":
+                        elif crrl_missing_prompt == "default":
                             w = float(default_weight)
                         else:
                             raise KeyError(
-                                "Prompt missing in SPO state/baseline map while weighted_sampling=True. "
+                                "Prompt missing in CRRL baseline map while weighted_sampling=True. "
                                 f"prompt='{p_str[:160]}...'"
                             )
                         items.append(i)
@@ -647,73 +893,27 @@ class RayPPOTrainer(BaseRayPPOTrainer):
 
                     micro_prompts = batch.non_tensor_batch.get("raw_prompt", None)
                     micro_prompts = [_[0]["content"].strip() for _ in micro_prompts]
-                    if self.config.trainer.spo.enable:
-                        sum_reward_tensor = reward_tensor.sum(dim=-1)
-
-                        spo_metrics = {}
-                        r = sum_reward_tensor
-                        spo_metrics["spo/reward"] = r.mean().detach().item()
-
-                        if spo_mode == "stateful":
-                            alpha = [prompt2alpha[_] for _ in micro_prompts]
-                            beta = [prompt2beta[_] for _ in micro_prompts]
-                            alpha = torch.tensor(alpha, dtype=torch.float).to(r)
-                            beta = torch.tensor(beta, dtype=torch.float).to(r)
-                            spo_metrics["spo/alpha"] = alpha.mean().detach().item()
-                            spo_metrics["spo/beta"] = beta.mean().detach().item()
-                            Neff = alpha + beta
-                            spo_metrics["spo/Neff"] = Neff.mean().detach().item()
-                            p_hats = alpha / Neff
-                        else:
-                            missing_baseline_count = 0
-                            baseline_values = []
-                            for prompt in micro_prompts:
-                                if prompt in prompt2baseline:
-                                    baseline_values.append(prompt2baseline[prompt])
-                                elif spo_missing_prompt == "default":
-                                    baseline_values.append(spo_default_p_hat)
-                                    missing_baseline_count += 1
-                                else:
-                                    raise KeyError(
-                                        "Prompt missing in trainer.spo.baseline_values while mode='baseline_only'. "
-                                        f"prompt='{prompt[:160]}...'"
-                                    )
-                            p_hats = torch.tensor(baseline_values, dtype=torch.float).to(r)
-                            spo_metrics["spo/missing_baseline_count"] = float(missing_baseline_count)
-
-                        spo_metrics["spo/p_hats"] = p_hats.mean().detach().item()
-
-                        # Recalculate advantages
-                        advantages = r - p_hats
-                        spo_metrics["spo/adv_before_norm"] = advantages.mean().detach().item()
-
-                        response_mask = compute_response_mask(batch)
-                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                        quantiles = torch.tensor([0.1, 0.3, 0.5, 0.7, 0.9], device=advantages.device)
-                        q_vals = torch.quantile(advantages, quantiles)
-                        spo_metrics["spo/adv_after_norm/p10"] = q_vals[0].item()
-                        spo_metrics["spo/adv_after_norm/p30"] = q_vals[1].item()
-                        spo_metrics["spo/adv_after_norm/p50"] = q_vals[2].item()
-                        spo_metrics["spo/adv_after_norm/p70"] = q_vals[3].item()
-                        spo_metrics["spo/adv_after_norm/p90"] = q_vals[4].item()
-                        advantages = advantages.unsqueeze(-1) * response_mask
-                        batch.batch["advantages"] = advantages
-                        batch.batch["returns"] = advantages
+                    crrl_metrics = {}
+                    r = None
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        if self.config.trainer.spo.enable and spo_mode == "stateful":
-                            spo_log_prob_batch_backup = batch.select(deepcopy=True)
-
+                        if estimator_enabled and estimator_capture_spec is not None:
+                            batch.meta_info["estimator_hidden_capture"] = dict(estimator_capture_spec)
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
+                        token_entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                        entropy_agg = agg_loss(
+                            loss_mat=token_entropys,
+                            loss_mask=response_masks,
+                            loss_agg_mode=loss_agg_mode,
+                        )
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
+                        batch.meta_info.pop("estimator_hidden_capture", None)
 
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
@@ -762,6 +962,177 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         # IS and mismatch metrics already have mismatch/ prefix
                         metrics.update(is_metrics)
 
+                        if self.config.trainer.crrl.enable:
+                            r = reward_tensor.sum(dim=-1)
+                            crrl_metrics["crrl/reward"] = r.mean().detach().item()
+
+                            if estimator_enabled:
+                                raw_advantages, p_hats, value_predictions, estimator_training_rows = (
+                                    self._compute_estimator_cross_rollout_advantages(
+                                        batch=batch,
+                                        reward_sums=r,
+                                        token_entropys=token_entropys,
+                                        estimator=estimator,
+                                        feature_builder=estimator_feature_builder,
+                                        pair_size=estimator_pair_size,
+                                    )
+                                )
+                                p_hats = p_hats.to(r)
+                                crrl_metrics["crrl/value_predictions"] = value_predictions.mean().detach().item()
+                                crrl_metrics["crrl/cross_rollout_baseline"] = p_hats.mean().detach().item()
+
+                                estimator_train_prompt_hidden_rows.extend(
+                                    estimator_training_rows["prompt_hidden_rows"]
+                                )
+                                estimator_train_response_hidden_rows.extend(
+                                    estimator_training_rows["response_hidden_rows"]
+                                )
+                                estimator_train_response_feature_rows.extend(
+                                    estimator_training_rows["response_feature_rows"]
+                                )
+                                estimator_train_targets.extend(
+                                    float(v) for v in estimator_training_rows["targets"]
+                                )
+                                estimator_retrain_steps += 1
+                                crrl_metrics["crrl/adaptive_estimator/buffer_steps"] = float(estimator_retrain_steps)
+                                crrl_metrics["crrl/adaptive_estimator/buffer_rows"] = float(
+                                    len(estimator_train_targets)
+                                )
+                                crrl_metrics["crrl/adaptive_estimator/retrain_interval_steps"] = float(
+                                    estimator_retrain_interval_steps
+                                )
+                                crrl_metrics["crrl/adaptive_estimator/retrained_this_step"] = 0.0
+
+                                if estimator_retrain_steps >= estimator_retrain_interval_steps:
+                                    if estimator_fit_single_fn is None or estimator_save_bundle_fn is None:
+                                        raise RuntimeError("Adaptive estimator retrain functions are not initialized.")
+                                    if estimator_fit_config is None or estimator_feature_builder_config is None:
+                                        raise RuntimeError("Adaptive estimator retrain config is not initialized.")
+                                    if estimator_retrain_output_dir is None:
+                                        raise RuntimeError("Adaptive estimator retrain output dir is not initialized.")
+                                    if not estimator_train_targets:
+                                        raise RuntimeError(
+                                            "Adaptive estimator retrain interval reached but no buffered rows exist."
+                                        )
+
+                                    train_target_values = np.asarray(estimator_train_targets, dtype=np.float32)
+                                    os.makedirs(estimator_retrain_output_dir, exist_ok=True)
+                                    retrain_index = estimator_retrain_count + 1
+                                    retrain_prefix = os.path.join(
+                                        estimator_retrain_output_dir,
+                                        f"adaptive_estimator_step{self.global_steps:07d}_iter{retrain_index:03d}",
+                                    )
+                                    rows_dump_path = f"{retrain_prefix}.rows.npz"
+                                    model_path = f"{retrain_prefix}.joblib"
+                                    meta_path = f"{retrain_prefix}.meta.json"
+
+                                    if estimator_log_rows_on_retrain:
+                                        ordered_feature_keys = list(estimator_feature_builder_config.rollout_scalars.scalar_keys)
+                                        ordered_feature_keys.extend(
+                                            estimator_feature_builder_config.rollout_scalars.derived_scalar_keys
+                                        )
+                                        response_feature_matrix = np.asarray(
+                                            [
+                                                [float(row.get(key, 0.0)) for key in ordered_feature_keys]
+                                                for row in estimator_train_response_feature_rows
+                                            ],
+                                            dtype=np.float32,
+                                        )
+                                        np.savez_compressed(
+                                            rows_dump_path,
+                                            prompt_hidden=np.stack(estimator_train_prompt_hidden_rows, axis=0).astype(
+                                                np.float32
+                                            ),
+                                            response_hidden=np.stack(estimator_train_response_hidden_rows, axis=0).astype(
+                                                np.float32
+                                            ),
+                                            response_features=response_feature_matrix,
+                                            targets=train_target_values,
+                                        )
+                                        with open(f"{rows_dump_path}.keys.json", "w", encoding="utf-8") as f:
+                                            json.dump({"response_feature_keys": ordered_feature_keys}, f, ensure_ascii=False, indent=2)
+
+                                    bundle = estimator_fit_single_fn(
+                                        prompt_hidden_rows=estimator_train_prompt_hidden_rows,
+                                        response_hidden_rows=estimator_train_response_hidden_rows,
+                                        response_feature_rows=estimator_train_response_feature_rows,
+                                        targets=estimator_train_targets,
+                                        feature_builder_config=estimator_feature_builder_config,
+                                        fit_config=estimator_fit_config,
+                                    )
+                                    estimator_save_bundle_fn(bundle, model_path)
+                                    estimator = load_single_trajectory_estimator(model_path)
+
+                                    retrain_meta = {
+                                        "global_step": int(self.global_steps),
+                                        "retrain_index": int(retrain_index),
+                                        "interval_steps": int(estimator_retrain_interval_steps),
+                                        "num_rows": int(len(estimator_train_targets)),
+                                        "label_mean": float(train_target_values.mean()),
+                                        "label_min": float(train_target_values.min()),
+                                        "label_max": float(train_target_values.max()),
+                                        "model_path": model_path,
+                                        "rows_dump_path": rows_dump_path if estimator_log_rows_on_retrain else None,
+                                    }
+                                    with open(meta_path, "w", encoding="utf-8") as f:
+                                        json.dump(retrain_meta, f, ensure_ascii=False, indent=2)
+
+                                    estimator_retrain_count = retrain_index
+                                    crrl_metrics["crrl/adaptive_estimator/retrain_count"] = float(estimator_retrain_count)
+                                    crrl_metrics["crrl/adaptive_estimator/retrained_this_step"] = 1.0
+                                    crrl_metrics["crrl/adaptive_estimator/last_train_rows"] = float(
+                                        len(estimator_train_targets)
+                                    )
+                                    crrl_metrics["crrl/adaptive_estimator/last_label_mean"] = float(
+                                        train_target_values.mean()
+                                    )
+                                    crrl_metrics["crrl/adaptive_estimator/last_label_min"] = float(
+                                        train_target_values.min()
+                                    )
+                                    crrl_metrics["crrl/adaptive_estimator/last_label_max"] = float(
+                                        train_target_values.max()
+                                    )
+
+                                    estimator_train_prompt_hidden_rows = []
+                                    estimator_train_response_hidden_rows = []
+                                    estimator_train_response_feature_rows = []
+                                    estimator_train_targets = []
+                                    estimator_retrain_steps = 0
+                            else:
+                                missing_baseline_count = 0
+                                baseline_values = []
+                                for prompt in micro_prompts:
+                                    if prompt in prompt2baseline:
+                                        baseline_values.append(prompt2baseline[prompt])
+                                    elif crrl_missing_prompt == "default":
+                                        baseline_values.append(crrl_default_p_hat)
+                                        missing_baseline_count += 1
+                                    else:
+                                        raise KeyError(
+                                            "Prompt missing in trainer.crrl.baseline_values while "
+                                            "mode='non_adaptive_estimator'. "
+                                            f"prompt='{prompt[:160]}...'"
+                                        )
+                                p_hats = torch.tensor(baseline_values, dtype=torch.float).to(r)
+                                crrl_metrics["crrl/missing_baseline_count"] = float(missing_baseline_count)
+                                raw_advantages = r - p_hats
+
+                            crrl_metrics["crrl/p_hats"] = p_hats.mean().detach().item()
+                            crrl_metrics["crrl/adv_before_norm"] = raw_advantages.mean().detach().item()
+
+                            response_mask = compute_response_mask(batch)
+                            advantages = (raw_advantages - raw_advantages.mean()) / (raw_advantages.std() + 1e-8)
+                            quantiles = torch.tensor([0.1, 0.3, 0.5, 0.7, 0.9], device=advantages.device)
+                            q_vals = torch.quantile(advantages, quantiles)
+                            crrl_metrics["crrl/adv_after_norm/p10"] = q_vals[0].item()
+                            crrl_metrics["crrl/adv_after_norm/p30"] = q_vals[1].item()
+                            crrl_metrics["crrl/adv_after_norm/p50"] = q_vals[2].item()
+                            crrl_metrics["crrl/adv_after_norm/p70"] = q_vals[3].item()
+                            crrl_metrics["crrl/adv_after_norm/p90"] = q_vals[4].item()
+                            advantages = advantages.unsqueeze(-1) * response_mask
+                            batch.batch["advantages"] = advantages
+                            batch.batch["returns"] = advantages
+
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
@@ -794,35 +1165,18 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
-                    if self.config.trainer.spo.enable:
-                        if spo_mode == "stateful":
-                            rho, prompt2protodata, prompt2log_probs, prompt2D, rho_metrics = self._get_spo_rho(
-                                prompt2protodata, prompt2log_probs, prompt2D, micro_prompts, spo_log_prob_batch_backup
-                            )
-                            spo_metrics.update(rho_metrics)
-
-                            # if you want exact Beta intervals, maintain alpha/beta as well:
-                            alpha = rho * alpha + r
-                            beta = rho * beta + (1 - r)
-
-                            cur_sampled_numbers = []
-                            for i in range(len(alpha)):
-                                prompt2alpha[micro_prompts[i]] = alpha[i].item()
-                                prompt2beta[micro_prompts[i]] = beta[i].item()
-                                prompt2sampled_number[micro_prompts[i]] += 1
-                                cur_sampled_numbers.append(prompt2sampled_number[micro_prompts[i]])
-                        else:
-                            cur_sampled_numbers = []
-                            for prompt in micro_prompts:
-                                prompt2sampled_number[prompt] += 1
-                                cur_sampled_numbers.append(prompt2sampled_number[prompt])
+                    if self.config.trainer.crrl.enable:
+                        cur_sampled_numbers = []
+                        for prompt in micro_prompts:
+                            prompt2sampled_number[prompt] += 1
+                            cur_sampled_numbers.append(prompt2sampled_number[prompt])
 
                         cur_sampled_numbers = np.array(cur_sampled_numbers, dtype=np.int32)
-                        spo_metrics["spo/cur_sampled_number/min"] = cur_sampled_numbers.min()
-                        spo_metrics["spo/cur_sampled_number/max"] = cur_sampled_numbers.max()
-                        spo_metrics["spo/cur_sampled_number/mean"] = cur_sampled_numbers.mean()
+                        crrl_metrics["crrl/cur_sampled_number/min"] = cur_sampled_numbers.min()
+                        crrl_metrics["crrl/cur_sampled_number/max"] = cur_sampled_numbers.max()
+                        crrl_metrics["crrl/cur_sampled_number/mean"] = cur_sampled_numbers.mean()
 
-                        metrics.update(spo_metrics)
+                        metrics.update(crrl_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

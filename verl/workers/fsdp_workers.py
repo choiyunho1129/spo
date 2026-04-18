@@ -977,10 +977,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-            output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
-                meta_info={"temperature": self.config.rollout.temperature},
-            )
+            tensors = {"old_log_probs": output, "entropys": entropys}
+            hidden_capture = None
+            if hasattr(self.actor, "pop_hidden_capture"):
+                hidden_capture = self.actor.pop_hidden_capture()
+            if hidden_capture is not None:
+                tensors["estimator_prompt_hidden"] = hidden_capture["prompt_hidden"]
+                tensors["estimator_response_hidden"] = hidden_capture["response_hidden"]
+            output = DataProto.from_dict(tensors=tensors, meta_info={"temperature": self.config.rollout.temperature})
 
         output = output.to("cpu")
 
@@ -998,6 +1002,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
+        # Ref log-prob path must not capture estimator hidden states.
+        data.meta_info.pop("estimator_hidden_capture", None)
+
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True

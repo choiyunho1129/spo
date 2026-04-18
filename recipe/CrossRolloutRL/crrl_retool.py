@@ -1,5 +1,5 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
-# Modifications Copyright 2025 SPO authors
+# Modifications Copyright 2025 CRRL authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -149,7 +149,7 @@ class CustomRLHFDataset(RLHFDataset):
             data["source_prompt"] = self._build_dapo_source_prompt(problem)
         else:
             data["prompt"] = [{"role": "user", "content": problem + answer_format}]
-            data["agent_name"] = "spo_tool_agent"
+            data["agent_name"] = "crrl_tool_agent"
         return data
 
     def map_fn2(self, row: dict):
@@ -164,7 +164,7 @@ class CustomRLHFDataset(RLHFDataset):
 
         content = row["prompt"]
         row["prompt"] = [{"role": "user", "content": content + answer_format}]
-        row["agent_name"] = "spo_tool_agent"
+        row["agent_name"] = "crrl_tool_agent"
         return row
 
 

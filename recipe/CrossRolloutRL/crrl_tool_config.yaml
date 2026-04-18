@@ -1,5 +1,5 @@
 tools:
-  - class_name: "recipe.spo.spo_retool.CustomSandboxFusionTool"
+  - class_name: "recipe.CrossRolloutRL.crrl_retool.CustomSandboxFusionTool"
     config:
       sandbox_fusion_url: "http://localhost:8080/run_code"
       num_workers: 16

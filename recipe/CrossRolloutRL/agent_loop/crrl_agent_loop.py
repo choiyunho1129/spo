@@ -1,5 +1,5 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
-# Modifications Copyright 2025 SPO authors
+# Modifications Copyright 2025 CRRL authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-SPO Agent Loop - Extends base agent loop with code generation support.
+CRRL agent loop - Extends base agent loop with code generation support.
 
 This module inherits from verl.experimental.agent_loop and only overrides
-the generate_sequences method to add SPO-specific behavior:
-- multi-turn mode: add stop tokens for code generation and use spo_tool_agent.
+the generate_sequences method to add CRRL-specific behavior:
+- multi-turn mode: add stop tokens for code generation and use crrl_tool_agent.
 - single-turn mode: force single_turn_agent and use raw_prompt directly.
 """
 
@@ -28,7 +28,7 @@ import ray
 
 from verl import DataProto
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
-from .spo_tool_agent_loop import SPOToolAgentLoop
+from .crrl_tool_agent_loop import CRRLToolAgentLoop
 
 # Re-export all base classes for backward compatibility
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager, get_trajectory_info
@@ -38,19 +38,19 @@ from verl.experimental.agent_loop.agent_loop import (
 from verl.utils.transferqueue_utils import tqbridge
 
 # Keep strong references so module import always triggers @register(...).
-_ = [SPOToolAgentLoop, SingleTurnAgentLoop]
+_ = [CRRLToolAgentLoop, SingleTurnAgentLoop]
 
 __all__ = [
     "AgentLoopWorkerBase",
-    "SPOAgentLoopWorker",
-    "SPOAgentLoopManager",
+    "CRRLAgentLoopWorker",
+    "CRRLAgentLoopManager",
 ]
 
 
 class AgentLoopWorkerBase(BaseAgentLoopWorkerBase):
-    """SPO-specific agent loop worker with mode-aware behavior.
+    """CRRL-specific agent loop worker with mode-aware behavior.
 
-    In multi-turn mode, generation uses SPO code tags and tool-oriented stop tokens.
+    In multi-turn mode, generation uses CRRL code tags and tool-oriented stop tokens.
     In single-turn mode, generation uses raw_prompt directly via single_turn_agent.
     """
 
@@ -85,7 +85,7 @@ class AgentLoopWorkerBase(BaseAgentLoopWorkerBase):
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
-        # SPO-specific stop tokens should only be used in multi-turn tool mode.
+        # CRRL-specific stop tokens should only be used in multi-turn tool mode.
         if use_multi_turn:
             sampling_params["stop"] = "</code>"
             sampling_params["include_stop_str_in_output"] = True
@@ -95,7 +95,7 @@ class AgentLoopWorkerBase(BaseAgentLoopWorkerBase):
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["temperature"] = config.val_kwargs.temperature
 
-        # When multi_turn is disabled, force single-turn prompt path and bypass spo_tool_agent prompt rewriting.
+        # When multi_turn is disabled, force single-turn prompt path and bypass crrl_tool_agent prompt rewriting.
         if not use_multi_turn:
             batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(batch), dtype=object)
         elif "agent_name" not in batch.non_tensor_batch:
@@ -122,15 +122,15 @@ class AgentLoopWorkerBase(BaseAgentLoopWorkerBase):
 
 
 @ray.remote
-class SPOAgentLoopWorker(AgentLoopWorkerBase):
-    """SPO Agent Loop Worker as a Ray remote actor.
+class CRRLAgentLoopWorker(AgentLoopWorkerBase):
+    """CRRL agent loop worker as a Ray remote actor.
 
     This is a Ray remote actor wrapper around AgentLoopWorkerBase,
-    enabling distributed execution with SPO-specific stop tokens.
+    enabling distributed execution with CRRL-specific stop tokens.
     """
 
     def __init__(self, config, server_handles, reward_router_address=None):
-        """Initialize SPO Agent Loop Worker.
+        """Initialize CRRL agent loop worker.
 
         Args:
             config: trainer config.
@@ -140,22 +140,22 @@ class SPOAgentLoopWorker(AgentLoopWorkerBase):
         super().__init__(config, server_handles, reward_router_address)
 
 
-class SPOAgentLoopManager(AgentLoopManager):
-    """SPO-specific Agent Loop Manager that uses SPO's AgentLoopWorker.
+class CRRLAgentLoopManager(AgentLoopManager):
+    """CRRL-specific agent loop manager that uses CRRL's AgentLoopWorker.
 
     Inherits all functionality from base AgentLoopManager and only overrides
-    the agent_loop_workers_class to use SPOAgentLoopWorker which includes
+    the agent_loop_workers_class to use CRRLAgentLoopWorker which includes
     code generation stop tokens.
     """
 
     def __init__(self, config, worker_group=None, rm_wg=None):
-        """Initialize SPO Agent Loop Manager.
+        """Initialize CRRL agent loop manager.
 
         Args:
             config: trainer config.
             worker_group: ActorRolloutRef worker group for hybrid mode; None for standalone mode.
             rm_wg: Reward model worker group.
         """
-        # Set SPO-specific worker class before calling parent __init__
-        self.agent_loop_workers_class = SPOAgentLoopWorker
+        # Set CRRL-specific worker class before calling parent __init__
+        self.agent_loop_workers_class = CRRLAgentLoopWorker
         super().__init__(config, worker_group, rm_wg)
