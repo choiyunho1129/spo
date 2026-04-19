@@ -22,6 +22,7 @@ This trainer inherits from the base PPO trainer and adds CRRL-specific logic.
 import json
 import os
 import re
+import shutil
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -79,6 +80,199 @@ class RayPPOTrainer(BaseRayPPOTrainer):
 
     _THINK_CONTENT_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.IGNORECASE | re.DOTALL)
     _ANSWER_CONTENT_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
+    _ESTIMATOR_RESUME_STATE_FILENAME = "crrl_adaptive_estimator_resume_state.pt"
+    _ESTIMATOR_RESUME_META_FILENAME = "crrl_adaptive_estimator_resume_state.meta.json"
+    _ESTIMATOR_SNAPSHOT_FILENAME = "crrl_adaptive_estimator_current.joblib"
+
+    def _default_local_ckpt_root(self) -> str:
+        checkpoint_folder = str(self.config.trainer.default_local_dir)
+        if not os.path.isabs(checkpoint_folder):
+            checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
+        return checkpoint_folder
+
+    def _current_global_step_ckpt_dir(self) -> str:
+        return os.path.join(self._default_local_ckpt_root(), f"global_step_{self.global_steps}")
+
+    @staticmethod
+    def _normalize_hidden_rows(rows: list | None) -> list[np.ndarray]:
+        if rows is None:
+            return []
+        normalized_rows: list[np.ndarray] = []
+        for row in rows:
+            normalized_rows.append(np.asarray(row, dtype=np.float32).reshape(-1))
+        return normalized_rows
+
+    @staticmethod
+    def _normalize_feature_rows(rows: list | None) -> list[dict[str, float]]:
+        if rows is None:
+            return []
+        normalized_rows: list[dict[str, float]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise TypeError(f"Invalid estimator response feature row type: {type(row)}")
+            normalized_rows.append({str(k): float(v) for k, v in row.items()})
+        return normalized_rows
+
+    @staticmethod
+    def _normalize_targets(values: list | np.ndarray | None) -> list[float]:
+        if values is None:
+            return []
+        return [float(v) for v in values]
+
+    @staticmethod
+    def _runtime_estimator_to_bundle(estimator) -> dict:
+        return {
+            "bundle_type": "single_trajectory_estimator",
+            "bundle_version": 1,
+            "config": estimator.config.to_dict(),
+            "estimator": estimator.estimator,
+            "prompt_hidden_pca": estimator.prompt_hidden_projection,
+            "response_hidden_pca": estimator.response_hidden_projection,
+        }
+
+    @staticmethod
+    def _build_estimator_from_bundle(bundle: dict):
+        from recipe.CrossRolloutRL.estimator.single_trajectory_estimator import (
+            SingleTrajectoryEstimator,
+            SingleTrajectoryEstimatorConfig,
+        )
+
+        config_payload = bundle.get("config")
+        if config_payload is None:
+            raise ValueError("Estimator bundle does not contain 'config'.")
+        return SingleTrajectoryEstimator(
+            config=SingleTrajectoryEstimatorConfig.from_dict(config_payload),
+            estimator=bundle["estimator"],
+            prompt_hidden_projection=bundle.get("prompt_hidden_pca"),
+            response_hidden_projection=bundle.get(
+                "response_hidden_pca",
+                bundle.get("think_end_hidden_pca", bundle.get("trajectory_hidden_pca")),
+            ),
+        )
+
+    def _set_adaptive_estimator_checkpoint_state(
+        self,
+        *,
+        estimator_model_path: str | None,
+        estimator_bundle: dict | None,
+        retrain_steps: int,
+        retrain_count: int,
+        train_prompt_hidden_rows: list[np.ndarray],
+        train_response_hidden_rows: list[np.ndarray],
+        train_response_feature_rows: list[dict[str, float]],
+        train_targets: list[float],
+    ) -> None:
+        self._adaptive_estimator_checkpoint_state = {
+            "enabled": True,
+            "estimator_model_path": estimator_model_path,
+            "retrain_steps": int(retrain_steps),
+            "retrain_count": int(retrain_count),
+            "train_prompt_hidden_rows": self._normalize_hidden_rows(train_prompt_hidden_rows),
+            "train_response_hidden_rows": self._normalize_hidden_rows(train_response_hidden_rows),
+            "train_response_feature_rows": self._normalize_feature_rows(train_response_feature_rows),
+            "train_targets": self._normalize_targets(train_targets),
+        }
+        self._adaptive_estimator_checkpoint_bundle = estimator_bundle
+
+    def _clear_adaptive_estimator_checkpoint_state(self) -> None:
+        self._adaptive_estimator_checkpoint_state = None
+        self._adaptive_estimator_checkpoint_bundle = None
+
+    def _save_adaptive_estimator_checkpoint_state(self, checkpoint_dir: str) -> None:
+        state = getattr(self, "_adaptive_estimator_checkpoint_state", None)
+        if not state or not state.get("enabled", False):
+            return
+
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        saved_state = dict(state)
+        estimator_bundle = getattr(self, "_adaptive_estimator_checkpoint_bundle", None)
+
+        estimator_model_path = saved_state.get("estimator_model_path")
+        resolved_model_path = None
+        if estimator_model_path:
+            resolved_model_path = os.path.abspath(os.path.expanduser(str(estimator_model_path)))
+        snapshot_path = os.path.join(checkpoint_dir, self._ESTIMATOR_SNAPSHOT_FILENAME)
+        if estimator_bundle is not None:
+            try:
+                import joblib
+            except ImportError as exc:
+                raise ImportError(
+                    "joblib is required to save adaptive estimator checkpoint snapshots."
+                ) from exc
+            joblib.dump(estimator_bundle, snapshot_path)
+        elif estimator_model_path:
+            if os.path.exists(resolved_model_path):
+                shutil.copy2(resolved_model_path, snapshot_path)
+            else:
+                print(
+                    "[WARN] Adaptive estimator model snapshot source is missing; "
+                    f"keep original path only: {resolved_model_path}"
+                )
+
+        if os.path.exists(snapshot_path):
+            saved_state["estimator_model_path"] = snapshot_path
+        else:
+            saved_state["estimator_model_path"] = resolved_model_path
+
+        state_path = os.path.join(checkpoint_dir, self._ESTIMATOR_RESUME_STATE_FILENAME)
+        torch.save(saved_state, state_path)
+
+        meta_path = os.path.join(checkpoint_dir, self._ESTIMATOR_RESUME_META_FILENAME)
+        meta_payload = {
+            "schema_version": 1,
+            "retrain_steps": int(saved_state.get("retrain_steps", 0)),
+            "retrain_count": int(saved_state.get("retrain_count", 0)),
+            "buffer_rows": int(len(saved_state.get("train_targets", []))),
+            "estimator_model_path": saved_state.get("estimator_model_path"),
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta_payload, f, ensure_ascii=False, indent=2)
+
+    def _resolve_loaded_checkpoint_dir(self) -> str | None:
+        if self.global_steps <= 0:
+            return None
+
+        if self.config.trainer.resume_mode == "resume_path":
+            resume_path = self.config.trainer.resume_from_path
+            if isinstance(resume_path, str):
+                if not os.path.isabs(resume_path):
+                    resume_path = os.path.join(os.getcwd(), resume_path)
+                return resume_path
+
+        return self._current_global_step_ckpt_dir()
+
+    def _load_adaptive_estimator_checkpoint_state(self) -> None:
+        self._loaded_adaptive_estimator_checkpoint_state = None
+        checkpoint_dir = self._resolve_loaded_checkpoint_dir()
+        if checkpoint_dir is None:
+            return
+
+        state_path = os.path.join(checkpoint_dir, self._ESTIMATOR_RESUME_STATE_FILENAME)
+        if not os.path.exists(state_path):
+            return
+
+        loaded_state = torch.load(state_path, map_location="cpu", weights_only=False)
+        if not isinstance(loaded_state, dict) or not loaded_state.get("enabled", False):
+            return
+        self._loaded_adaptive_estimator_checkpoint_state = loaded_state
+        print(
+            "[DEBUG] Loaded adaptive estimator resume state from "
+            f"{state_path} (buffer_rows={len(loaded_state.get('train_targets', []))})"
+        )
+
+    def _pop_loaded_adaptive_estimator_checkpoint_state(self) -> dict | None:
+        state = getattr(self, "_loaded_adaptive_estimator_checkpoint_state", None)
+        self._loaded_adaptive_estimator_checkpoint_state = None
+        return state
+
+    def _save_checkpoint(self):
+        super()._save_checkpoint()
+        checkpoint_dir = self._current_global_step_ckpt_dir()
+        self._save_adaptive_estimator_checkpoint_state(checkpoint_dir)
+
+    def _load_checkpoint(self):
+        super()._load_checkpoint()
+        self._load_adaptive_estimator_checkpoint_state()
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -531,12 +725,11 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         estimator_feature_builder_config = None
         estimator_fit_config = None
         estimator_fit_single_fn = None
-        estimator_save_bundle_fn = None
+        estimator_current_model_path = None
+        estimator_current_bundle = None
         estimator_pair_size = 2
         estimator_capture_spec = None
         estimator_retrain_interval_steps = 4
-        estimator_retrain_output_dir = None
-        estimator_log_rows_on_retrain = True
         estimator_retrain_steps = 0
         estimator_retrain_count = 0
         estimator_train_prompt_hidden_rows: list[np.ndarray] = []
@@ -662,7 +855,6 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     SingleTrajectoryFeatureBuilder,
                     fit_single_trajectory_estimator,
                     load_single_trajectory_estimator,
-                    save_single_trajectory_estimator_bundle,
                 )
 
                 estimator_model_path = crrl_estimator_cfg.get("model_path", None)
@@ -671,6 +863,8 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         "trainer.crrl.estimator.model_path must be set when trainer.crrl.mode='adaptive_estimator'."
                     )
                 estimator = load_single_trajectory_estimator(estimator_model_path)
+                estimator_current_model_path = estimator_model_path
+                estimator_current_bundle = self._runtime_estimator_to_bundle(estimator)
 
                 feature_builder_config_path = crrl_estimator_cfg.get(
                     "feature_builder_config_path",
@@ -697,14 +891,12 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     fit_payload = json.load(f)
                 estimator_fit_config = SingleTrajectoryEstimatorFitConfig(**fit_payload)
                 estimator_fit_single_fn = fit_single_trajectory_estimator
-                estimator_save_bundle_fn = save_single_trajectory_estimator_bundle
 
-                estimator_retrain_output_dir = crrl_estimator_cfg.get("online_output_dir", None)
-                if not estimator_retrain_output_dir:
-                    estimator_retrain_output_dir = os.path.join(
-                        str(self.config.trainer.default_local_dir), "adaptive_estimator"
+                if crrl_estimator_cfg.get("online_output_dir", None):
+                    print(
+                        "[WARN] trainer.crrl.estimator.online_output_dir is ignored. "
+                        "Adaptive estimator artifacts are now checkpoint-only."
                     )
-                estimator_log_rows_on_retrain = bool(crrl_estimator_cfg.get("log_rows_on_retrain", True))
 
                 if feature_builder_config.prompt_hidden.layer_index != feature_builder_config.response_hidden.layer_index:
                     raise ValueError(
@@ -732,7 +924,67 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     "[DEBUG] Enabled CRRL estimator baseline: "
                     f"model={estimator_model_path}, pair_size={estimator_pair_size}, "
                     f"hidden_source=pi_theta, retrain_interval_steps={estimator_retrain_interval_steps}, "
-                    f"online_output_dir={estimator_retrain_output_dir}"
+                    "persistence=checkpoint_only"
+                )
+
+                loaded_estimator_state = self._pop_loaded_adaptive_estimator_checkpoint_state()
+                if loaded_estimator_state is not None:
+                    loaded_model_path = loaded_estimator_state.get("estimator_model_path")
+                    resolved_loaded_model_path = None
+                    if loaded_model_path:
+                        resolved_loaded_model_path = os.path.abspath(os.path.expanduser(str(loaded_model_path)))
+
+                    if resolved_loaded_model_path and os.path.exists(resolved_loaded_model_path):
+                        estimator = load_single_trajectory_estimator(resolved_loaded_model_path)
+                        estimator_current_model_path = resolved_loaded_model_path
+                        estimator_current_bundle = self._runtime_estimator_to_bundle(estimator)
+                    elif loaded_model_path:
+                        print(
+                            "[WARN] Resume estimator model path does not exist. "
+                            f"Fallback to configured model_path={estimator_model_path}: {resolved_loaded_model_path}"
+                        )
+
+                    estimator_retrain_steps = int(loaded_estimator_state.get("retrain_steps", 0))
+                    estimator_retrain_count = int(loaded_estimator_state.get("retrain_count", 0))
+                    estimator_train_prompt_hidden_rows = self._normalize_hidden_rows(
+                        loaded_estimator_state.get("train_prompt_hidden_rows")
+                    )
+                    estimator_train_response_hidden_rows = self._normalize_hidden_rows(
+                        loaded_estimator_state.get("train_response_hidden_rows")
+                    )
+                    estimator_train_response_feature_rows = self._normalize_feature_rows(
+                        loaded_estimator_state.get("train_response_feature_rows")
+                    )
+                    estimator_train_targets = self._normalize_targets(loaded_estimator_state.get("train_targets"))
+
+                    prompt_rows_len = len(estimator_train_prompt_hidden_rows)
+                    response_rows_len = len(estimator_train_response_hidden_rows)
+                    feature_rows_len = len(estimator_train_response_feature_rows)
+                    target_rows_len = len(estimator_train_targets)
+                    if len({prompt_rows_len, response_rows_len, feature_rows_len, target_rows_len}) != 1:
+                        raise ValueError(
+                            "Loaded adaptive estimator resume buffer has inconsistent row counts: "
+                            f"prompt={prompt_rows_len}, response={response_rows_len}, "
+                            f"feature={feature_rows_len}, targets={target_rows_len}"
+                        )
+                    print(
+                        "[DEBUG] Restored adaptive estimator state from checkpoint: "
+                        f"retrain_steps={estimator_retrain_steps}, retrain_count={estimator_retrain_count}, "
+                        f"buffer_rows={target_rows_len}, model={estimator_current_model_path}"
+                    )
+            if not estimator_enabled:
+                loaded_estimator_state = self._pop_loaded_adaptive_estimator_checkpoint_state()
+                if loaded_estimator_state is not None:
+                    print(
+                        "[WARN] Adaptive estimator resume state exists but current mode is "
+                        f"{crrl_mode}. Ignoring estimator resume payload."
+                    )
+        else:
+            loaded_estimator_state = self._pop_loaded_adaptive_estimator_checkpoint_state()
+            if loaded_estimator_state is not None:
+                print(
+                    "[WARN] Adaptive estimator resume state exists but trainer.crrl.enable is False. "
+                    "Ignoring estimator resume payload."
                 )
 
         for epoch in range(self.config.trainer.total_epochs):
@@ -1070,53 +1322,17 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 )
 
                                 if estimator_retrain_steps >= estimator_retrain_interval_steps:
-                                    if estimator_fit_single_fn is None or estimator_save_bundle_fn is None:
+                                    if estimator_fit_single_fn is None:
                                         raise RuntimeError("Adaptive estimator retrain functions are not initialized.")
                                     if estimator_fit_config is None or estimator_feature_builder_config is None:
                                         raise RuntimeError("Adaptive estimator retrain config is not initialized.")
-                                    if estimator_retrain_output_dir is None:
-                                        raise RuntimeError("Adaptive estimator retrain output dir is not initialized.")
                                     if not estimator_train_targets:
                                         raise RuntimeError(
                                             "Adaptive estimator retrain interval reached but no buffered rows exist."
                                         )
 
                                     train_target_values = np.asarray(estimator_train_targets, dtype=np.float32)
-                                    os.makedirs(estimator_retrain_output_dir, exist_ok=True)
                                     retrain_index = estimator_retrain_count + 1
-                                    retrain_prefix = os.path.join(
-                                        estimator_retrain_output_dir,
-                                        f"adaptive_estimator_step{self.global_steps:07d}_iter{retrain_index:03d}",
-                                    )
-                                    rows_dump_path = f"{retrain_prefix}.rows.npz"
-                                    model_path = f"{retrain_prefix}.joblib"
-                                    meta_path = f"{retrain_prefix}.meta.json"
-
-                                    if estimator_log_rows_on_retrain:
-                                        ordered_feature_keys = list(estimator_feature_builder_config.rollout_scalars.scalar_keys)
-                                        ordered_feature_keys.extend(
-                                            estimator_feature_builder_config.rollout_scalars.derived_scalar_keys
-                                        )
-                                        response_feature_matrix = np.asarray(
-                                            [
-                                                [float(row.get(key, 0.0)) for key in ordered_feature_keys]
-                                                for row in estimator_train_response_feature_rows
-                                            ],
-                                            dtype=np.float32,
-                                        )
-                                        np.savez_compressed(
-                                            rows_dump_path,
-                                            prompt_hidden=np.stack(estimator_train_prompt_hidden_rows, axis=0).astype(
-                                                np.float32
-                                            ),
-                                            response_hidden=np.stack(estimator_train_response_hidden_rows, axis=0).astype(
-                                                np.float32
-                                            ),
-                                            response_features=response_feature_matrix,
-                                            targets=train_target_values,
-                                        )
-                                        with open(f"{rows_dump_path}.keys.json", "w", encoding="utf-8") as f:
-                                            json.dump({"response_feature_keys": ordered_feature_keys}, f, ensure_ascii=False, indent=2)
 
                                     bundle = estimator_fit_single_fn(
                                         prompt_hidden_rows=estimator_train_prompt_hidden_rows,
@@ -1126,8 +1342,9 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                         feature_builder_config=estimator_feature_builder_config,
                                         fit_config=estimator_fit_config,
                                     )
-                                    estimator_save_bundle_fn(bundle, model_path)
-                                    estimator = load_single_trajectory_estimator(model_path)
+                                    estimator = self._build_estimator_from_bundle(bundle)
+                                    estimator_current_bundle = bundle
+                                    estimator_current_model_path = None
 
                                     train_predictions = np.asarray(
                                         [
@@ -1159,20 +1376,6 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                     if not np.isfinite(pearson):
                                         pearson = 0.0
                                     crrl_metrics["crrl/adaptive_estimator/pred_target_pearson"] = pearson
-
-                                    retrain_meta = {
-                                        "global_step": int(self.global_steps),
-                                        "retrain_index": int(retrain_index),
-                                        "interval_steps": int(estimator_retrain_interval_steps),
-                                        "num_rows": int(len(estimator_train_targets)),
-                                        "label_mean": float(train_target_values.mean()),
-                                        "label_min": float(train_target_values.min()),
-                                        "label_max": float(train_target_values.max()),
-                                        "model_path": model_path,
-                                        "rows_dump_path": rows_dump_path if estimator_log_rows_on_retrain else None,
-                                    }
-                                    with open(meta_path, "w", encoding="utf-8") as f:
-                                        json.dump(retrain_meta, f, ensure_ascii=False, indent=2)
 
                                     estimator_retrain_count = retrain_index
                                     crrl_metrics["crrl/adaptive_estimator/last_label_mean"] = float(
@@ -1300,6 +1503,19 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     if esi_close_to_expiration:
                         print("Force saving checkpoint: ESI instance expiration approaching.")
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        if estimator_enabled:
+                            self._set_adaptive_estimator_checkpoint_state(
+                                estimator_model_path=estimator_current_model_path,
+                                estimator_bundle=estimator_current_bundle,
+                                retrain_steps=estimator_retrain_steps,
+                                retrain_count=estimator_retrain_count,
+                                train_prompt_hidden_rows=estimator_train_prompt_hidden_rows,
+                                train_response_hidden_rows=estimator_train_response_hidden_rows,
+                                train_response_feature_rows=estimator_train_response_feature_rows,
+                                train_targets=estimator_train_targets,
+                            )
+                        else:
+                            self._clear_adaptive_estimator_checkpoint_state()
                         self._save_checkpoint()
 
                 with marked_timer("stop_profile", timing_raw):

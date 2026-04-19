@@ -30,7 +30,6 @@ ESTIMATOR_FEATURE_BUILDER_CONFIG=${ESTIMATOR_FEATURE_BUILDER_CONFIG:-"recipe/Cro
 ESTIMATOR_FIT_CONFIG=${ESTIMATOR_FIT_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_estimator_fit_config.json"}
 ESTIMATOR_PAIR_SIZE=${ESTIMATOR_PAIR_SIZE:-2}
 ESTIMATOR_RETRAIN_INTERVAL_STEPS=${ESTIMATOR_RETRAIN_INTERVAL_STEPS:-8}
-ESTIMATOR_LOG_ROWS_ON_RETRAIN=${ESTIMATOR_LOG_ROWS_ON_RETRAIN:-"True"}
 CRRL_MISSING_PROMPT=${CRRL_MISSING_PROMPT:-"default"} # error | default
 CRRL_DEFAULT_P_HAT=${CRRL_DEFAULT_P_HAT:-0.5}
 CRRL_WEIGHTED_SAMPLING=${CRRL_WEIGHTED_SAMPLING:-"False"}
@@ -53,7 +52,6 @@ project_name='ValueEstimator'
 experiment_name=$EXP_NAME
 default_local_dir=$OUTPUT_DIR/$experiment_name/checkpoints
 validation_data_dir=$OUTPUT_DIR/$experiment_name/validation_data
-ESTIMATOR_ONLINE_OUTPUT_DIR=${ESTIMATOR_ONLINE_OUTPUT_DIR:-"$OUTPUT_DIR/$experiment_name/adaptive_estimator"}
 
 # ================= algorithm =================
 adv_estimator=grpo
@@ -191,6 +189,4 @@ python3 -m recipe.CrossRolloutRL.crrl_main_ppo \
     trainer.crrl.estimator.fit_config_path=$ESTIMATOR_FIT_CONFIG \
     trainer.crrl.estimator.pair_size=$ESTIMATOR_PAIR_SIZE \
     trainer.crrl.estimator.retrain_interval_steps=$ESTIMATOR_RETRAIN_INTERVAL_STEPS \
-    trainer.crrl.estimator.online_output_dir=$ESTIMATOR_ONLINE_OUTPUT_DIR \
-    trainer.crrl.estimator.log_rows_on_retrain=$ESTIMATOR_LOG_ROWS_ON_RETRAIN \
     trainer.debug=$DEBUG  \
