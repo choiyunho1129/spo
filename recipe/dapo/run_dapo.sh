@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='ValueEstimator'
-exp_name='Qwen3-4B_Baseline_DAPO_batch_1024'
+exp_name='Qwen3-4B_DAPO_batch_1024_temp_1.0'
 
 export CUDA_VISIBLE_DEVICES=1,2,3,4
 adv_estimator=grpo
@@ -48,9 +48,9 @@ val_files="['${AIME_2024_FILE}', '${AIME_2025_FILE}']"
 custom_data_and_reward_path=${CUSTOM_DATA_AND_REWARD_PATH:-"${WORKING_DIR}/recipe/spo/spo_retool.py"}
 
 # Algorithm
-temperature=0.6
-top_p=0.95
-top_k=20 # 0 for HF rollout, -1 for vLLM rollout
+temperature=1
+top_p=1
+top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 
 infer_tp=1 # vllm
 train_sp=4 # train
@@ -76,7 +76,7 @@ python3 -m recipe.dapo.main_dapo \
     data.max_response_length=${max_response_length} \
     data.gen_batch_size=${gen_prompt_bsz} \
     data.train_batch_size=${train_prompt_bsz} \
-    data.val_batch_size=256 \
+    data.val_batch_size=128 \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
@@ -116,10 +116,8 @@ python3 -m recipe.dapo.main_dapo \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k="${top_k}" \
-    actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
-    actor_rollout_ref.rollout.val_kwargs.top_p=${top_p} \
-    actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
-    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.val_kwargs.n=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     custom_reward_function.path="${custom_data_and_reward_path}" \
@@ -130,9 +128,9 @@ python3 -m recipe.dapo.main_dapo \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=$train_sp \
     trainer.nnodes=1 \
-    trainer.save_freq=20 \
+    trainer.save_freq=10 \
     trainer.test_freq=10 \
     trainer.total_epochs=10 \
     trainer.total_training_steps=1500 \
     trainer.val_only=False \
-    trainer.val_before_train=False
+    trainer.val_before_train=True
