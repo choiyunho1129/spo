@@ -11,11 +11,11 @@ export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
 
 OUTPUT_DIR=${OUTPUT_DIR:-"spo_verl_pr"}
 TRAIN_DATA_DIR=${TRAIN_DATA_DIR:-"data/DAPO-Math-17k-Processed_Splits"}
-EXP_NAME=${EXP_NAME:-"Qwen3-4B_EstimatedValue_SPO_batch_1024"}
+EXP_NAME=${EXP_NAME:-"Qwen3-4B_GRPO_batch_1024"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
 N_VAL=${N_VAL:-8}
-METHOD=${METHOD:-"SPO"}
+METHOD=${METHOD:-"GRPO"}
 DEBUG=${DEBUG:-"False"}
 #OFFLINE_VALUES=${OFFLINE_VALUES:-"DAPO-Math-17k-Processed_Splits/offline_values.json"}
 SPO_MODE=${SPO_MODE:-"baseline_only"} # stateful | baseline_only
@@ -40,8 +40,8 @@ default_agent_loop=spo_tool_agent
 # wandb
 project_name='ValueEstimator'
 experiment_name=$EXP_NAME
-default_local_dir=$OUTPUT_DIR/$project_name/$experiment_name/checkpoints
-validation_data_dir=$OUTPUT_DIR/$project_name/$experiment_name/validation_data
+default_local_dir=$OUTPUT_DIR/$experiment_name/checkpoints
+validation_data_dir=$OUTPUT_DIR/$experiment_name/validation_data
 
 # ================= algorithm =================
 adv_estimator=grpo
@@ -169,7 +169,7 @@ python3 -m recipe.spo.spo_main_ppo \
     trainer.nnodes=1 \
     trainer.default_local_dir=$default_local_dir \
     trainer.validation_data_dir=$validation_data_dir \
-    trainer.save_freq=20 \
+    trainer.save_freq=10 \
     trainer.test_freq=10 \
     trainer.total_epochs=500 \
     trainer.spo.enable=$spo_enable \

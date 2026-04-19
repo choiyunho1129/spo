@@ -660,6 +660,9 @@ class RayPPOTrainer:
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
+                # `score` duplicates reward-style signal for DAPO-style tasks and clutters val-aux.
+                if var_name == "score":
+                    continue
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
                     if (
