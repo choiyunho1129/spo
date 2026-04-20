@@ -1,3 +1,5 @@
+
+# git check
 set -x
 export CUDA_VISIBLE_DEVICES=3
 export VLLM_USE_V1=1
