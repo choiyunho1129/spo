@@ -120,11 +120,12 @@ ENV/
 # data
 *.parquet
 /data/
+/recipe/CrossRolloutRL/estimator/artifacts/
 /spo_verl_pr/
+/spo_verl_pr_temp1/
 /crrl_verl_pr/
 # local logs
 logs
 log
 outputs
 .history
-

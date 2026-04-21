@@ -147,6 +147,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for rollout selection.")
     parser.add_argument(
+        "--prompt-selection",
+        choices=["first", "random"],
+        default="first",
+        help="How to select prompts when --max-prompts is set.",
+    )
+    parser.add_argument(
         "--model-path",
         type=str,
         default="Qwen/Qwen3-4B",
@@ -256,6 +262,7 @@ def build_prompt_pairs(
     subset_ids: list[int],
     rollouts_per_prompt: int,
     pair_selection: str,
+    prompt_selection: str,
     seed: int,
     max_prompts: int | None,
 ) -> list[PromptPair]:
@@ -316,7 +323,12 @@ def build_prompt_pairs(
             )
 
     if max_prompts is not None:
-        pairs = pairs[: max(0, int(max_prompts))]
+        max_prompts = max(0, int(max_prompts))
+        if prompt_selection == "random":
+            if max_prompts < len(pairs):
+                pairs = rng.sample(pairs, k=max_prompts)
+        else:
+            pairs = pairs[:max_prompts]
 
     return pairs
 
@@ -558,6 +570,7 @@ def main() -> None:
         subset_ids=subset_ids,
         rollouts_per_prompt=args.rollouts_per_prompt,
         pair_selection=args.pair_selection,
+        prompt_selection=args.prompt_selection,
         seed=args.seed,
         max_prompts=args.max_prompts,
     )
@@ -715,6 +728,7 @@ def main() -> None:
         "dtype": str(dtype),
         "subset_ids": subset_ids,
         "pair_selection": args.pair_selection,
+        "prompt_selection": args.prompt_selection,
         "seed": int(args.seed),
         "rollouts_per_prompt": int(args.rollouts_per_prompt),
         "total_prompts": int(len(prompt_pairs)),

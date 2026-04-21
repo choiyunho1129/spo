@@ -18,7 +18,7 @@ export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_DIR}/wandb"}
 #base config
 OUTPUT_DIR=${OUTPUT_DIR:-"crrl_verl_pr"}
 TRAIN_DATA_DIR=${TRAIN_DATA_DIR:-"data/DAPO-Math-17k-Processed_Splits"}
-EXP_NAME=${EXP_NAME:-"Qwen3-4B_CRRL_batch_256_B200"}
+EXP_NAME=${EXP_NAME:-"Qwen3-4B_CRRL_batch_1024_B200"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
 N_VAL=${N_VAL:-8}
@@ -27,11 +27,11 @@ DEBUG=${DEBUG:-"False"}
 #estimator config
 CRRL_MODE=${CRRL_MODE:-"adaptive_estimator"} # non_adaptive_estimator | adaptive_estimator
 BASELINE_VALUES=${BASELINE_VALUES:-"/NHNHOME/WORKSPACE/26msit006_A/kisti/snu/yunhochoi/crrl/data/dapo_math_17k_baseline.jsonl"}
-ESTIMATOR_MODEL_PATH=${ESTIMATOR_MODEL_PATH:-"recipe/CrossRolloutRL/estimator/artifacts/qwen3_4b_subset3_6_pairavg_estimator.joblib"}
+ESTIMATOR_MODEL_PATH=${ESTIMATOR_MODEL_PATH:-"yunhochoi/crrl/recipe/CrossRolloutRL/estimator/artifacts/qwen3_4b_subset0_1_temp1_pairavg_estimator.joblib"}
 ESTIMATOR_FEATURE_BUILDER_CONFIG=${ESTIMATOR_FEATURE_BUILDER_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_feature_builder_config.json"}
 ESTIMATOR_FIT_CONFIG=${ESTIMATOR_FIT_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_estimator_fit_config.json"}
 ESTIMATOR_PAIR_SIZE=${ESTIMATOR_PAIR_SIZE:-2}
-ESTIMATOR_RETRAIN_INTERVAL_STEPS=${ESTIMATOR_RETRAIN_INTERVAL_STEPS:-8}
+ESTIMATOR_RETRAIN_INTERVAL_STEPS=${ESTIMATOR_RETRAIN_INTERVAL_STEPS:-4}
 CRRL_MISSING_PROMPT=${CRRL_MISSING_PROMPT:-"default"} # error | default
 CRRL_DEFAULT_P_HAT=${CRRL_DEFAULT_P_HAT:-0.5}
 CRRL_WEIGHTED_SAMPLING=${CRRL_WEIGHTED_SAMPLING:-"False"}
@@ -77,10 +77,10 @@ reward_manager=naive
 
 n_resp_per_prompt=2
 n_resp_per_prompt_val=$N_VAL
-train_batch_size=128
+train_batch_size=512
 ppo_mini_batch_size=64
-val_batch_size=64
-gen_batch_size=128 # prompt batch size before rollout repeat
+val_batch_size=128
+gen_batch_size=512 # prompt batch size before rollout repeat
 crrl_enable=True
 
 # Canonicalize mode and enforce supported options.
@@ -166,7 +166,6 @@ python3 -m recipe.CrossRolloutRL.crrl_main_ppo \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
-    actor_rollout_ref.rollout.val_kwargs.top_k=20 \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
     trainer.logger=['console','wandb'] \
     trainer.project_name=$project_name \

@@ -15,6 +15,7 @@ export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
 # ================= data/model/tool =================
 OUTPUT_DIR=${OUTPUT_DIR:-"spo_verl_pr"}
 DATA_FILE=${DATA_FILE:-"/NHNHOME/WORKSPACE/26msit006_A/kisti/snu/yunhochoi/spo/data/DAPO-Math-17k-Processed_Splits/subset_13.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"$DATA_FILE"}
 EXP_NAME=${EXP_NAME:-"offline_value_estimation"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
@@ -22,9 +23,11 @@ N_VAL=${N_VAL:-2}
 DEBUG=${DEBUG:-"False"}
 export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_DIR}/wandb"}
 
-train_files="['/NHNHOME/WORKSPACE/26msit006_A/kisti/snu/yunhochoi/spo/data/DAPO-Math-17k-Processed_Splits/subset_13.parquet']"
+# Keep train_files configurable. In val_only mode the code path still constructs
+# the train dataset, so a stale hardcoded path can crash the run before rollout.
+train_files="['${TRAIN_FILE}']"
 val_files="$DATA_FILE"
-echo "Evaluating on train_files"
+echo "Evaluating with TRAIN_FILE=${TRAIN_FILE}, DATA_FILE=${DATA_FILE}"
 
 # tool
 tool_config_path=recipe/spo/spo_tool_config.yaml
@@ -118,9 +121,9 @@ python3 -m recipe.spo.spo_main_ppo \
     actor_rollout_ref.rollout.multi_turn.format=spo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
-    actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
-    actor_rollout_ref.rollout.val_kwargs.top_k=20 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=1 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
+    actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
     trainer.logger=['console','wandb'] \
     trainer.project_name=$project_name \
