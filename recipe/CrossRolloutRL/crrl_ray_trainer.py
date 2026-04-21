@@ -276,7 +276,7 @@ class RayPPOTrainer(BaseRayPPOTrainer):
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
-        reward_extra_infos_dict.pop("acc", None)
+        reward_extra_infos_dict = {k: v for k, v in reward_extra_infos_dict.items() if k != "acc"}
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
