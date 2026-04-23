@@ -29,6 +29,15 @@ class SingleTrajectoryEstimatorConfig:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "SingleTrajectoryEstimatorConfig":
+        derived_response_feature_keys = list(
+            payload.get("derived_response_feature_keys", payload.get("trajectory_derived_scalar_keys", []))
+        )
+        response_payload = payload.get("response")
+        if isinstance(response_payload, dict):
+            for field_path in response_payload.get("extra_scalar_field_paths", []):
+                key = str(field_path).replace(".", "_")
+                if key not in derived_response_feature_keys:
+                    derived_response_feature_keys.append(key)
         return cls(
             prompt_hidden_projection=ProjectionConfig(**dict(payload["prompt_hidden_projection"])),
             response_hidden_projection=ProjectionConfig(
@@ -40,9 +49,7 @@ class SingleTrajectoryEstimatorConfig:
                 )
             ),
             response_feature_keys=tuple(payload.get("response_feature_keys", payload.get("trajectory_scalar_keys", []))),
-            derived_response_feature_keys=tuple(
-                payload.get("derived_response_feature_keys", payload.get("trajectory_derived_scalar_keys", []))
-            ),
+            derived_response_feature_keys=tuple(derived_response_feature_keys),
             model=EstimatorModelConfig(**dict(payload["model"])),
         )
 

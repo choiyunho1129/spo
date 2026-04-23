@@ -142,10 +142,12 @@ class SingleTrajectoryFeatureBuilder:
         response_record: dict[str, Any],
     ) -> dict[str, float]:
         """Return the scalar features used by the estimator."""
-        feature_map = extract_rollout_numeric_features(response_record)
+        extra_paths = self.config.rollout_scalars.extra_scalar_field_paths
+        feature_map = extract_rollout_numeric_features(response_record, extra_numeric_fields=extra_paths)
         feature_map.update(extract_derived_rollout_features(feature_map))
         ordered_keys = list(self.config.rollout_scalars.scalar_keys)
         ordered_keys.extend(self.config.rollout_scalars.derived_scalar_keys)
+        ordered_keys.extend(path.replace(".", "_") for path in extra_paths)
         return {key: float(feature_map.get(key, 0.0)) for key in ordered_keys}
 
     def build_inputs(

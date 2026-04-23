@@ -9,8 +9,17 @@ import numpy as np
 
 REQUIRED_ACTUAL_TOKEN_ENTROPY_KEYS = {
     "output_mean_token_entropy",
+    "output_last_token_entropy",
+    "output_max_token_entropy",
+    "output_min_token_entropy",
     "reasoning_mean_token_entropy",
+    "reasoning_last_token_entropy",
+    "reasoning_max_token_entropy",
+    "reasoning_min_token_entropy",
     "answer_mean_token_entropy",
+    "answer_last_token_entropy",
+    "answer_max_token_entropy",
+    "answer_min_token_entropy",
 }
 
 THINK_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.IGNORECASE | re.DOTALL)
@@ -33,6 +42,19 @@ def coerce_float(value: Any) -> float | None:
             return None
         return converted if math.isfinite(converted) else None
     return None
+
+
+def get_nested_value(record: dict[str, Any], field_path: str) -> Any:
+    value: Any = record
+    for part in field_path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+
+def sanitize_name(field_path: str) -> str:
+    return re.sub(r"[^0-9A-Za-z_]+", "_", field_path).strip("_")
 
 
 def tokenize_whitespace(text: str) -> list[str]:
@@ -90,7 +112,10 @@ def extract_actual_entropy_features(record: dict[str, Any]) -> dict[str, float]:
     return features
 
 
-def extract_rollout_numeric_features(record: dict[str, Any]) -> dict[str, float]:
+def extract_rollout_numeric_features(
+    record: dict[str, Any],
+    extra_numeric_fields: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, float]:
     token_stats = record.get("token_stats") or {}
     generated_text, reasoning_content, answer_content = extract_reasoning_and_answer(record)
 
@@ -110,6 +135,10 @@ def extract_rollout_numeric_features(record: dict[str, Any]) -> dict[str, float]
         "reasoning_unique_token_ratio": unique_token_ratio(reasoning_content),
     }
     features.update({key: value for key, value in builtins.items() if value is not None})
+    for field_path in extra_numeric_fields or ():
+        numeric = coerce_float(get_nested_value(record, str(field_path)))
+        if numeric is not None:
+            features[sanitize_name(str(field_path))] = numeric
     return features
 
 

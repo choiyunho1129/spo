@@ -111,13 +111,13 @@ def resolve_transformer_layers(model: torch.nn.Module) -> Any:
 
 
 def parse_args() -> argparse.Namespace:
-    default_feature_cfg = THIS_DIR / "single_trajectory_estimator_support/default_feature_builder_config.json"
-    default_fit_cfg = THIS_DIR / "single_trajectory_estimator_support/default_estimator_fit_config.json"
-    default_output_model = THIS_DIR / "artifacts/qwen3_4b_subset3_6_pairavg_estimator.joblib"
+    default_feature_cfg = THIS_DIR / "single_trajectory_estimator_support/simple_structure_feature_builder_config.json"
+    default_fit_cfg = THIS_DIR / "single_trajectory_estimator_support/simple_structure_estimator_fit_config.json"
+    default_output_model = THIS_DIR / "artifacts/qwen3_4b_simple_structure_other_rollout_estimator.joblib"
 
     parser = argparse.ArgumentParser(
         description=(
-            "Train single-trajectory estimator with prompt-wise pair-average targets from "
+            "Train single-trajectory estimator with pair-average or other-rollout targets from "
             "offline_value_estimation_subset_{3,4,5,6}/validation_data/0.jsonl"
         )
     )
@@ -399,6 +399,24 @@ def mean_at_indices(values: np.ndarray, indices: list[int]) -> float:
     return float(values[clipped].mean())
 
 
+def entropy_stats(values: np.ndarray, indices: list[int] | None = None) -> dict[str, float]:
+    if values.size == 0:
+        return {"mean": 0.0, "last": 0.0, "max": 0.0, "min": 0.0}
+    if indices is None:
+        selected = values
+    else:
+        clipped = [idx for idx in indices if 0 <= idx < values.shape[0]]
+        selected = values[clipped] if clipped else np.asarray([], dtype=values.dtype)
+    if selected.size == 0:
+        return {"mean": 0.0, "last": 0.0, "max": 0.0, "min": 0.0}
+    return {
+        "mean": float(selected.mean()),
+        "last": float(selected[-1]),
+        "max": float(selected.max()),
+        "min": float(selected.min()),
+    }
+
+
 def classify_exception(exc: Exception) -> tuple[str, str]:
     message = str(exc).strip().replace("\n", " ")
     lowered = message.lower()
@@ -435,10 +453,6 @@ def compute_rollout_entropy_features(
     response_ids: list[int],
     response_entropies: np.ndarray,
 ) -> dict[str, float]:
-    output_mean = float(response_entropies.mean()) if response_entropies.size > 0 else 0.0
-    reasoning_mean = 0.0
-    answer_mean = 0.0
-
     reasoning_indices: list[int] = []
     answer_indices: list[int] = []
 
@@ -457,13 +471,23 @@ def compute_rollout_entropy_features(
     if use_offset_fallback:
         reasoning_indices, answer_indices = fallback_segment_indices(tokenizer, generated_text, len(response_ids))
 
-    reasoning_mean = mean_at_indices(response_entropies, reasoning_indices)
-    answer_mean = mean_at_indices(response_entropies, answer_indices)
+    output_stats = entropy_stats(response_entropies)
+    reasoning_stats = entropy_stats(response_entropies, reasoning_indices)
+    answer_stats = entropy_stats(response_entropies, answer_indices)
 
     return {
-        "output_mean_token_entropy": output_mean,
-        "reasoning_mean_token_entropy": reasoning_mean,
-        "answer_mean_token_entropy": answer_mean,
+        "output_mean_token_entropy": output_stats["mean"],
+        "output_last_token_entropy": output_stats["last"],
+        "output_max_token_entropy": output_stats["max"],
+        "output_min_token_entropy": output_stats["min"],
+        "reasoning_mean_token_entropy": reasoning_stats["mean"],
+        "reasoning_last_token_entropy": reasoning_stats["last"],
+        "reasoning_max_token_entropy": reasoning_stats["max"],
+        "reasoning_min_token_entropy": reasoning_stats["min"],
+        "answer_mean_token_entropy": answer_stats["mean"],
+        "answer_last_token_entropy": answer_stats["last"],
+        "answer_max_token_entropy": answer_stats["max"],
+        "answer_min_token_entropy": answer_stats["min"],
     }
 
 
@@ -560,6 +584,11 @@ def main() -> None:
     fit_payload = load_json(args.fit_config)
     feature_builder_config = FeatureBuilderConfig.from_dict(feature_builder_payload)
     fit_config = SingleTrajectoryEstimatorFitConfig(**fit_payload)
+    if fit_config.target_mode not in {"pair_average", "other_rollout_correctness"}:
+        raise ValueError(
+            "--fit-config target_mode must be one of {'pair_average', 'other_rollout_correctness'}, "
+            f"got {fit_config.target_mode!r}."
+        )
     builder = SingleTrajectoryFeatureBuilder(feature_builder_config)
 
     prompt_layer_index = int(feature_builder_config.prompt_hidden.layer_index)
@@ -651,11 +680,20 @@ def main() -> None:
             if pair_failed or len(pair_features) != 2:
                 skipped_prompts += 1
             else:
-                for prompt_hidden, response_hidden, response_features in pair_features:
+                if fit_config.target_mode == "pair_average":
+                    pair_targets = [pair.avg_score, pair.avg_score]
+                else:
+                    first_rollout, second_rollout = pair.selected_rollouts
+                    pair_targets = [float(second_rollout.score), float(first_rollout.score)]
+                for (prompt_hidden, response_hidden, response_features), target in zip(
+                    pair_features,
+                    pair_targets,
+                    strict=True,
+                ):
                     prompt_hidden_rows.append(prompt_hidden)
                     response_hidden_rows.append(response_hidden)
                     response_feature_rows.append(response_features)
-                    targets.append(pair.avg_score)
+                    targets.append(float(target))
                 used_prompts += 1
 
             if args.log_every > 0 and prompt_idx % args.log_every == 0:
@@ -687,7 +725,10 @@ def main() -> None:
             f"{details}"
         )
 
-    print(f"[INFO] Fitting estimator on {len(targets)} rows ({used_prompts} prompts x 2 rollouts).")
+    print(
+        f"[INFO] Fitting estimator on {len(targets)} rows ({used_prompts} prompts x 2 rollouts), "
+        f"target_mode={fit_config.target_mode}."
+    )
     bundle = fit_single_trajectory_estimator(
         prompt_hidden_rows=prompt_hidden_rows,
         response_hidden_rows=response_hidden_rows,
@@ -731,6 +772,7 @@ def main() -> None:
         "prompt_selection": args.prompt_selection,
         "seed": int(args.seed),
         "rollouts_per_prompt": int(args.rollouts_per_prompt),
+        "target_mode": str(fit_config.target_mode),
         "total_prompts": int(len(prompt_pairs)),
         "used_prompts": int(used_prompts),
         "skipped_prompts": int(skipped_prompts),

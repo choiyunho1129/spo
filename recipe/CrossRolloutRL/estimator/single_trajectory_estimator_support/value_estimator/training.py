@@ -20,6 +20,7 @@ class SingleTrajectoryEstimatorFitConfig:
     prompt_hidden_pca_dim: int = 0
     response_hidden_pca_dim: int = 0
     alpha: float = 300.0
+    target_mode: str = "pair_average"
     random_seed: int = 42
     clip_min: float = 0.0
     clip_max: float = 1.0
@@ -82,7 +83,8 @@ def build_training_matrix(
             output_dim=None if response_hidden_projection is None else int(response_hidden_projection.n_components_),
         ),
         response_feature_keys=tuple(feature_builder_config.rollout_scalars.scalar_keys),
-        derived_response_feature_keys=tuple(feature_builder_config.rollout_scalars.derived_scalar_keys),
+        derived_response_feature_keys=tuple(feature_builder_config.rollout_scalars.derived_scalar_keys)
+        + tuple(path.replace(".", "_") for path in feature_builder_config.rollout_scalars.extra_scalar_field_paths),
         model=EstimatorModelConfig(
             alpha=float(fit_config.alpha),
             clip_min=float(fit_config.clip_min),
