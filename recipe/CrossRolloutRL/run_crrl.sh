@@ -78,7 +78,10 @@ n_resp_per_prompt_val=$N_VAL
 train_batch_size=512
 ppo_mini_batch_size=64
 val_batch_size=128
-gen_batch_size=512 # prompt batch size before rollout repeat
+gen_batch_size=8 
+CRRL_DEFAULT_BR_SIZE=${CRRL_DEFAULT_BR_SIZE:-768}
+CRRL_BETA=${CRRL_BETA:-1.25}
+CRRL_ADVANTAGE_ZERO_EPS=${CRRL_ADVANTAGE_ZERO_EPS:-1e-8}
 crrl_enable=True
 
 # Canonicalize mode and enforce supported options.
@@ -128,6 +131,9 @@ python3 -m recipe.CrossRolloutRL.crrl_main_ppo \
     data.custom_cls.path=recipe/CrossRolloutRL/crrl_retool.py \
     data.custom_cls.name=CustomRLHFDataset \
     +data.gen_batch_size=$gen_batch_size \
+    +data.default_br_size=$CRRL_DEFAULT_BR_SIZE \
+    +data.beta=$CRRL_BETA \
+    +data.advantage_zero_eps=$CRRL_ADVANTAGE_ZERO_EPS \
     custom_reward_function.path=recipe/CrossRolloutRL/crrl_retool.py \
     custom_reward_function.name=compute_score \
     reward_model.reward_manager=$reward_manager \
@@ -164,7 +170,7 @@ python3 -m recipe.CrossRolloutRL.crrl_main_ppo \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
-    actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
+    actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \-
     trainer.logger=['console','wandb'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \

@@ -63,6 +63,42 @@ def _get_generated_token_stats(batch: DataProto) -> dict[str, int]:
     }
 
 
+def _compute_raw_sequence_advantages_for_logging(
+    batch: DataProto, adv_estimator: AdvantageEstimator
+) -> torch.Tensor | None:
+    response_mask = batch.batch.get("response_mask", None)
+    token_level_rewards = batch.batch.get("token_level_rewards", None)
+    if response_mask is None or token_level_rewards is None:
+        return None
+
+    response_mask_float = response_mask.to(torch.float32)
+    seq_rewards = (token_level_rewards.to(torch.float32) * response_mask_float).sum(dim=-1)
+
+    if adv_estimator in (AdvantageEstimator.GRPO, AdvantageEstimator.GRPO_VECTORIZED):
+        uids = batch.non_tensor_batch.get("uid", None)
+        if uids is None:
+            return None
+
+        uid2indices = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            uid2indices[str(uid)].append(idx)
+
+        raw_seq_adv = seq_rewards.clone()
+        for indices in uid2indices.values():
+            idx_tensor = torch.tensor(indices, device=seq_rewards.device, dtype=torch.long)
+            mean_val = torch.mean(seq_rewards[idx_tensor])
+            raw_seq_adv[idx_tensor] = seq_rewards[idx_tensor] - mean_val
+        return raw_seq_adv
+
+    if adv_estimator == AdvantageEstimator.REMAX:
+        reward_baselines = batch.batch.get("reward_baselines", None)
+        if reward_baselines is None:
+            return None
+        return seq_rewards - reward_baselines.to(torch.float32).to(seq_rewards.device)
+
+    return None
+
+
 class RayGRESOTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -509,6 +545,20 @@ class RayGRESOTrainer(RayPPOTrainer):
                         metrics.update(is_metrics)
 
                     with marked_timer("adv", timing_raw, "brown"):
+                        raw_adv_estimator = self.config.algorithm.adv_estimator
+                        try:
+                            raw_adv_estimator = AdvantageEstimator(raw_adv_estimator)
+                        except ValueError:
+                            raw_adv_estimator = None
+
+                        if raw_adv_estimator is not None:
+                            raw_seq_adv = _compute_raw_sequence_advantages_for_logging(
+                                batch=batch,
+                                adv_estimator=raw_adv_estimator,
+                            )
+                            if raw_seq_adv is not None:
+                                metrics["greso/raw_advantages/var"] = raw_seq_adv.var(unbiased=False).detach().item()
+
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
                         batch = compute_advantage(

@@ -133,6 +133,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     reward_min = torch.min(non_aborted_sequence_reward).detach().item()
 
     valid_adv = torch.masked_select(advantages, response_mask)
+    response_mask_float = response_mask.to(torch.float32)
+    seq_adv = (advantages.to(torch.float32) * response_mask_float).sum(dim=-1) / response_mask_float.sum(
+        dim=-1
+    ).clamp_min(1.0)
+    non_aborted_seq_adv = seq_adv[non_aborted_mask]
     valid_returns = torch.masked_select(returns, response_mask)
 
     if use_critic:
@@ -170,6 +175,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/advantages/max": torch.max(valid_adv).detach().item(),
         "critic/advantages/min": torch.min(valid_adv).detach().item(),
         # variance of per-token advantages in the current batch
+        "critic/advantages/token_var": torch.var(valid_adv, unbiased=False).detach().item(),
+        # variance of per-sequence mean advantages in the current batch
+        "critic/advantages/sequence_var": torch.var(non_aborted_seq_adv, unbiased=False).detach().item(),
+        # backward-compatible alias for token-level variance
         "critic/advantages/var": torch.var(valid_adv, unbiased=False).detach().item(),
         # returns
         "critic/returns/mean": torch.mean(valid_returns).detach().item(),

@@ -103,6 +103,8 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/score/mean", metrics)
         self.assertIn("critic/rewards/mean", metrics)
         self.assertIn("critic/advantages/mean", metrics)
+        self.assertIn("critic/advantages/token_var", metrics)
+        self.assertIn("critic/advantages/sequence_var", metrics)
         self.assertIn("critic/returns/mean", metrics)
         self.assertIn("critic/values/mean", metrics)
         self.assertIn("critic/vf_explained_var", metrics)
@@ -112,6 +114,9 @@ class TestComputeDataMetrics(unittest.TestCase):
         # Check some specific values
         self.assertAlmostEqual(metrics["critic/score/mean"], 5.0)  # Sum of token_level_scores
         self.assertAlmostEqual(metrics["critic/rewards/mean"], 2.5)  # Sum of token_level_rewards
+        self.assertAlmostEqual(metrics["critic/advantages/token_var"], 0.0125)
+        self.assertAlmostEqual(metrics["critic/advantages/sequence_var"], 0.01)
+        self.assertAlmostEqual(metrics["critic/advantages/var"], metrics["critic/advantages/token_var"])
 
     def test_compute_data_metrics_without_critic(self):
         """Test compute_data_metrics with critic disabled."""

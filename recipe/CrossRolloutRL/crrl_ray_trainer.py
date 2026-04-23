@@ -23,7 +23,7 @@ import json
 import os
 import re
 import shutil
-import uuid
+import hashlib
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
@@ -118,6 +118,71 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         if values is None:
             return []
         return [float(v) for v in values]
+
+    @staticmethod
+    def _build_stable_uids_from_input_ids(input_ids: torch.Tensor) -> np.ndarray:
+        uids = []
+        for row in input_ids:
+            uid_str = hashlib.md5(str(row.tolist()).encode("utf-8")).hexdigest()
+            uids.append(uid_str)
+        return np.array(uids, dtype=object)
+
+    @staticmethod
+    def _get_nonzero_advantage_indices(
+        batch: DataProto, *, zero_eps: float, raw_advantages: torch.Tensor | None = None
+    ) -> tuple[list[int], int, int]:
+        if raw_advantages is None and "advantages" not in batch.batch:
+            raise KeyError(
+                "Group filtering requires either `raw_advantages` input or 'advantages' in batch.batch."
+            )
+        if "uid" not in batch.non_tensor_batch:
+            raise KeyError("Group filtering requires non_tensor field 'uid'.")
+
+        if raw_advantages is not None:
+            if raw_advantages.ndim == 1:
+                seq_adv = raw_advantages.to(torch.float32)
+            elif raw_advantages.ndim == 2:
+                response_mask = batch.batch.get("response_mask", None)
+                if response_mask is not None and response_mask.shape == raw_advantages.shape:
+                    mask = response_mask.to(torch.float32)
+                    denom = mask.sum(dim=-1).clamp_min(1.0)
+                    seq_adv = (raw_advantages.to(torch.float32) * mask).sum(dim=-1) / denom
+                else:
+                    seq_adv = raw_advantages.to(torch.float32).mean(dim=-1)
+            else:
+                raise ValueError(
+                    f"Unsupported raw_advantages rank={raw_advantages.ndim}. Expected rank 1 or 2."
+                )
+        else:
+            advantages = batch.batch["advantages"]
+            response_mask = batch.batch.get("response_mask", None)
+            if advantages.ndim == 1:
+                seq_adv = advantages.to(torch.float32)
+            elif response_mask is not None and response_mask.shape == advantages.shape:
+                mask = response_mask.to(torch.float32)
+                denom = mask.sum(dim=-1).clamp_min(1.0)
+                seq_adv = (advantages.to(torch.float32) * mask).sum(dim=-1) / denom
+            else:
+                seq_adv = advantages.to(torch.float32).mean(dim=-1)
+
+        seq_adv_np = seq_adv.detach().cpu().numpy().astype(np.float32, copy=False)
+        uid_abs_max_adv: dict[str, float] = {}
+        for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+            uid_str = str(uid)
+            abs_adv = float(abs(seq_adv_np[idx]))
+            prev = uid_abs_max_adv.get(uid_str, 0.0)
+            if abs_adv > prev:
+                uid_abs_max_adv[uid_str] = abs_adv
+
+        kept_prompt_uids = {
+            uid for uid, max_abs_adv in uid_abs_max_adv.items() if max_abs_adv > zero_eps
+        }
+        kept_indices = [
+            idx for idx, uid in enumerate(batch.non_tensor_batch["uid"]) if str(uid) in kept_prompt_uids
+        ]
+        total_prompt_count = len(uid_abs_max_adv)
+        kept_prompt_count = len(kept_prompt_uids)
+        return kept_indices, total_prompt_count, kept_prompt_count
 
     @staticmethod
     def _runtime_estimator_to_bundle(estimator) -> dict:
@@ -987,6 +1052,26 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     "Ignoring estimator resume payload."
                 )
 
+        target_prompt_batch_size = int(self.config.data.train_batch_size)
+        rollout_repeat = int(self.config.actor_rollout_ref.rollout.n)
+        target_traj_batch_size = target_prompt_batch_size * rollout_repeat
+        default_br_size = int(self.config.data.get("default_br_size", 768))
+        if default_br_size <= 0:
+            raise ValueError(f"data.default_br_size must be a positive integer, got {default_br_size}")
+        adaptive_beta = float(self.config.data.get("beta", 1.25))
+        if adaptive_beta <= 0:
+            raise ValueError(f"data.beta must be positive, got {adaptive_beta}")
+        advantage_zero_eps = float(self.config.data.get("advantage_zero_eps", 1e-8))
+        if advantage_zero_eps < 0:
+            raise ValueError(f"data.advantage_zero_eps must be >= 0, got {advantage_zero_eps}")
+
+        pre_filter_buffer = None
+        final_accumulation = None
+        final_accumulation_estimator_rows = None
+        target_accumulation_size = default_br_size
+        seen_prompt_count = 0
+        zero_adv_prompt_count = 0
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 if self.config.trainer.crrl.enable and crrl_weighted_sampling:
@@ -1050,6 +1135,21 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                             batch_dict = sampled_batch_dict
                             print(f"[DEBUG] Final size of keep_idx: {len(keep_idx)}")
 
+                new_batch: DataProto = DataProto.from_single_dict(batch_dict)
+                new_batch.non_tensor_batch["uid"] = self._build_stable_uids_from_input_ids(new_batch.batch["input_ids"])
+
+                if pre_filter_buffer is None:
+                    pre_filter_buffer = new_batch
+                else:
+                    pre_filter_buffer = DataProto.concat([pre_filter_buffer, new_batch])
+
+                current_prompt_pool_size = len(set(pre_filter_buffer.non_tensor_batch["uid"]))
+                if current_prompt_pool_size < target_accumulation_size:
+                    continue
+
+                batch = pre_filter_buffer
+                pre_filter_buffer = None
+
                 metrics = {}
                 timing_raw = {}
 
@@ -1059,12 +1159,6 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-
-                # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                )
 
                 gen_batch = self._get_gen_batch(batch)
 
@@ -1189,6 +1283,8 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
+                        raw_advantages_for_filter = None
+                        estimator_training_rows = None
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
@@ -1303,90 +1399,6 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                     np.mean(pred_values_np >= (clip_max - 1e-6))
                                 )
 
-                                estimator_train_prompt_hidden_rows.extend(
-                                    estimator_training_rows["prompt_hidden_rows"]
-                                )
-                                estimator_train_response_hidden_rows.extend(
-                                    estimator_training_rows["response_hidden_rows"]
-                                )
-                                estimator_train_response_feature_rows.extend(
-                                    estimator_training_rows["response_feature_rows"]
-                                )
-                                estimator_train_targets.extend(
-                                    float(v) for v in estimator_training_rows["targets"]
-                                )
-                                estimator_retrain_steps += 1
-                                crrl_metrics["crrl/adaptive_estimator/buffer_steps"] = float(estimator_retrain_steps)
-                                crrl_metrics["crrl/adaptive_estimator/buffer_rows"] = float(
-                                    len(estimator_train_targets)
-                                )
-
-                                if estimator_retrain_steps >= estimator_retrain_interval_steps:
-                                    if estimator_fit_single_fn is None:
-                                        raise RuntimeError("Adaptive estimator retrain functions are not initialized.")
-                                    if estimator_fit_config is None or estimator_feature_builder_config is None:
-                                        raise RuntimeError("Adaptive estimator retrain config is not initialized.")
-                                    if not estimator_train_targets:
-                                        raise RuntimeError(
-                                            "Adaptive estimator retrain interval reached but no buffered rows exist."
-                                        )
-
-                                    train_target_values = np.asarray(estimator_train_targets, dtype=np.float32)
-                                    retrain_index = estimator_retrain_count + 1
-
-                                    bundle = estimator_fit_single_fn(
-                                        prompt_hidden_rows=estimator_train_prompt_hidden_rows,
-                                        response_hidden_rows=estimator_train_response_hidden_rows,
-                                        response_feature_rows=estimator_train_response_feature_rows,
-                                        targets=estimator_train_targets,
-                                        feature_builder_config=estimator_feature_builder_config,
-                                        fit_config=estimator_fit_config,
-                                    )
-                                    estimator = self._build_estimator_from_bundle(bundle)
-                                    estimator_current_bundle = bundle
-                                    estimator_current_model_path = None
-
-                                    train_predictions = np.asarray(
-                                        [
-                                            estimator.predict_value(
-                                                prompt_hidden=prompt_hidden_row,
-                                                response_hidden=response_hidden_row,
-                                                response_features=response_feature_row,
-                                            )
-                                            for prompt_hidden_row, response_hidden_row, response_feature_row in zip(
-                                                estimator_train_prompt_hidden_rows,
-                                                estimator_train_response_hidden_rows,
-                                                estimator_train_response_feature_rows,
-                                                strict=True,
-                                            )
-                                        ],
-                                        dtype=np.float32,
-                                    )
-                                    train_errors = train_predictions - train_target_values
-                                    crrl_metrics["crrl/adaptive_estimator/train_mae"] = float(np.mean(np.abs(train_errors)))
-                                    crrl_metrics["crrl/adaptive_estimator/train_rmse"] = float(
-                                        np.sqrt(np.mean(np.square(train_errors)))
-                                    )
-                                    pred_std = float(train_predictions.std())
-                                    target_std = float(train_target_values.std())
-                                    if train_predictions.size > 1 and pred_std > 1e-8 and target_std > 1e-8:
-                                        pearson = float(np.corrcoef(train_predictions, train_target_values)[0, 1])
-                                    else:
-                                        pearson = 0.0
-                                    if not np.isfinite(pearson):
-                                        pearson = 0.0
-                                    crrl_metrics["crrl/adaptive_estimator/pred_target_pearson"] = pearson
-
-                                    estimator_retrain_count = retrain_index
-                                    crrl_metrics["crrl/adaptive_estimator/last_label_mean"] = float(
-                                        train_target_values.mean()
-                                    )
-
-                                    estimator_train_prompt_hidden_rows = []
-                                    estimator_train_response_hidden_rows = []
-                                    estimator_train_response_feature_rows = []
-                                    estimator_train_targets = []
-                                    estimator_retrain_steps = 0
                             else:
                                 missing_baseline_count = 0
                                 baseline_values = []
@@ -1406,8 +1418,13 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 crrl_metrics["crrl/missing_baseline_count"] = float(missing_baseline_count)
                                 raw_advantages = r - p_hats
 
+                            raw_advantages_float = raw_advantages.to(torch.float32)
+                            raw_advantages_var = float(raw_advantages_float.var(unbiased=False).detach().cpu().item())
                             crrl_metrics["crrl/p_hats"] = p_hats.mean().detach().item()
                             crrl_metrics["crrl/adv_before_norm"] = raw_advantages.mean().detach().item()
+                            crrl_metrics["crrl/raw_advantages/var"] = raw_advantages_var
+                            # Group filtering should use raw (pre-normalized) sequence advantages.
+                            raw_advantages_for_filter = raw_advantages
 
                             response_mask = compute_response_mask(batch)
                             advantages = (raw_advantages - raw_advantages.mean()) / (raw_advantages.std() + 1e-8)
@@ -1437,6 +1454,208 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                 config=self.config.algorithm,
                             )
+
+                    kept_traj_indices, seen_prompts_in_pool, kept_prompts_in_pool = self._get_nonzero_advantage_indices(
+                        batch, zero_eps=advantage_zero_eps, raw_advantages=raw_advantages_for_filter
+                    )
+                    zero_prompts_in_pool = seen_prompts_in_pool - kept_prompts_in_pool
+                    seen_prompt_count += seen_prompts_in_pool
+                    zero_adv_prompt_count += zero_prompts_in_pool
+
+                    if kept_traj_indices:
+                        filtered_batch = batch[kept_traj_indices]
+                        if final_accumulation is None:
+                            final_accumulation = filtered_batch
+                        else:
+                            final_accumulation = DataProto.concat([final_accumulation, filtered_batch])
+                        if estimator_enabled:
+                            if estimator_training_rows is None:
+                                raise RuntimeError(
+                                    "Estimator is enabled but estimator_training_rows is missing before filtering."
+                                )
+
+                            filtered_prompt_hidden_rows = [
+                                estimator_training_rows["prompt_hidden_rows"][idx] for idx in kept_traj_indices
+                            ]
+                            filtered_response_hidden_rows = [
+                                estimator_training_rows["response_hidden_rows"][idx] for idx in kept_traj_indices
+                            ]
+                            filtered_response_feature_rows = [
+                                estimator_training_rows["response_feature_rows"][idx] for idx in kept_traj_indices
+                            ]
+                            filtered_targets = [estimator_training_rows["targets"][idx] for idx in kept_traj_indices]
+
+                            if final_accumulation_estimator_rows is None:
+                                final_accumulation_estimator_rows = {
+                                    "prompt_hidden_rows": filtered_prompt_hidden_rows,
+                                    "response_hidden_rows": filtered_response_hidden_rows,
+                                    "response_feature_rows": filtered_response_feature_rows,
+                                    "targets": filtered_targets,
+                                }
+                            else:
+                                final_accumulation_estimator_rows["prompt_hidden_rows"].extend(
+                                    filtered_prompt_hidden_rows
+                                )
+                                final_accumulation_estimator_rows["response_hidden_rows"].extend(
+                                    filtered_response_hidden_rows
+                                )
+                                final_accumulation_estimator_rows["response_feature_rows"].extend(
+                                    filtered_response_feature_rows
+                                )
+                                final_accumulation_estimator_rows["targets"].extend(filtered_targets)
+                        num_final_prompts = len(set(final_accumulation.non_tensor_batch["uid"]))
+                    else:
+                        num_final_prompts = (
+                            len(set(final_accumulation.non_tensor_batch["uid"])) if final_accumulation is not None else 0
+                        )
+
+                    alpha = zero_adv_prompt_count / seen_prompt_count if seen_prompt_count > 0 else 0.0
+                    crrl_metrics["crrl/group_filter/alpha"] = float(alpha)
+                    crrl_metrics["crrl/group_filter/default_br_size"] = float(default_br_size)
+                    crrl_metrics["crrl/group_filter/seen_prompts_pool"] = float(seen_prompts_in_pool)
+                    crrl_metrics["crrl/group_filter/zero_adv_prompts_pool"] = float(zero_prompts_in_pool)
+                    crrl_metrics["crrl/group_filter/kept_prompts_pool"] = float(kept_prompts_in_pool)
+                    crrl_metrics["crrl/group_filter/effective_prompts_total"] = float(num_final_prompts)
+
+                    if num_final_prompts < target_prompt_batch_size:
+                        batch_delta = target_prompt_batch_size - num_final_prompts
+                        estimated_br = int((adaptive_beta * batch_delta) / (1.0 - alpha + 1e-6))
+                        next_target = min(default_br_size, estimated_br)
+                        next_target = max(1, next_target)
+                        target_accumulation_size = next_target
+                        crrl_metrics["crrl/group_filter/next_br"] = float(next_target)
+                        print(
+                            "[CRRL][GroupFilter] "
+                            f"effective={num_final_prompts}/{target_prompt_batch_size}, "
+                            f"need={batch_delta}, alpha={alpha:.4f}, next_br={next_target}"
+                        )
+                        with marked_timer("stop_profile", timing_raw):
+                            next_step_profile = (
+                                self.global_steps + 1 in self.config.global_profiler.steps
+                                if self.config.global_profiler.steps is not None
+                                else False
+                            )
+                            self._stop_profiling(
+                                curr_step_profile and not next_step_profile
+                                if self.config.global_profiler.profile_continuous_steps
+                                else curr_step_profile
+                            )
+                            prev_step_profile = curr_step_profile
+                            curr_step_profile = next_step_profile
+                        continue
+
+                    batch = final_accumulation[:target_traj_batch_size]
+                    if estimator_enabled:
+                        if final_accumulation_estimator_rows is None:
+                            raise RuntimeError(
+                                "Estimator is enabled but no filtered estimator rows were accumulated for final batch."
+                            )
+
+                        final_prompt_hidden_rows = final_accumulation_estimator_rows["prompt_hidden_rows"][
+                            :target_traj_batch_size
+                        ]
+                        final_response_hidden_rows = final_accumulation_estimator_rows["response_hidden_rows"][
+                            :target_traj_batch_size
+                        ]
+                        final_response_feature_rows = final_accumulation_estimator_rows["response_feature_rows"][
+                            :target_traj_batch_size
+                        ]
+                        final_targets = final_accumulation_estimator_rows["targets"][:target_traj_batch_size]
+
+                        final_row_count = len(final_targets)
+                        if not (
+                            final_row_count
+                            == len(final_prompt_hidden_rows)
+                            == len(final_response_hidden_rows)
+                            == len(final_response_feature_rows)
+                            == len(batch.batch)
+                        ):
+                            raise ValueError(
+                                "Final estimator rows are inconsistent with final training batch size: "
+                                f"rows={final_row_count}, batch={len(batch.batch)}"
+                            )
+
+                        estimator_train_prompt_hidden_rows.extend(final_prompt_hidden_rows)
+                        estimator_train_response_hidden_rows.extend(final_response_hidden_rows)
+                        estimator_train_response_feature_rows.extend(final_response_feature_rows)
+                        estimator_train_targets.extend(float(v) for v in final_targets)
+                        estimator_retrain_steps += 1
+                        crrl_metrics["crrl/adaptive_estimator/buffer_steps"] = float(estimator_retrain_steps)
+                        crrl_metrics["crrl/adaptive_estimator/buffer_rows"] = float(len(estimator_train_targets))
+
+                        if estimator_retrain_steps >= estimator_retrain_interval_steps:
+                            if estimator_fit_single_fn is None:
+                                raise RuntimeError("Adaptive estimator retrain functions are not initialized.")
+                            if estimator_fit_config is None or estimator_feature_builder_config is None:
+                                raise RuntimeError("Adaptive estimator retrain config is not initialized.")
+                            if not estimator_train_targets:
+                                raise RuntimeError(
+                                    "Adaptive estimator retrain interval reached but no buffered rows exist."
+                                )
+
+                            train_target_values = np.asarray(estimator_train_targets, dtype=np.float32)
+                            retrain_index = estimator_retrain_count + 1
+
+                            bundle = estimator_fit_single_fn(
+                                prompt_hidden_rows=estimator_train_prompt_hidden_rows,
+                                response_hidden_rows=estimator_train_response_hidden_rows,
+                                response_feature_rows=estimator_train_response_feature_rows,
+                                targets=estimator_train_targets,
+                                feature_builder_config=estimator_feature_builder_config,
+                                fit_config=estimator_fit_config,
+                            )
+                            estimator = self._build_estimator_from_bundle(bundle)
+                            estimator_current_bundle = bundle
+                            estimator_current_model_path = None
+
+                            train_predictions = np.asarray(
+                                [
+                                    estimator.predict_value(
+                                        prompt_hidden=prompt_hidden_row,
+                                        response_hidden=response_hidden_row,
+                                        response_features=response_feature_row,
+                                    )
+                                    for prompt_hidden_row, response_hidden_row, response_feature_row in zip(
+                                        estimator_train_prompt_hidden_rows,
+                                        estimator_train_response_hidden_rows,
+                                        estimator_train_response_feature_rows,
+                                        strict=True,
+                                    )
+                                ],
+                                dtype=np.float32,
+                            )
+                            train_errors = train_predictions - train_target_values
+                            crrl_metrics["crrl/adaptive_estimator/train_mae"] = float(np.mean(np.abs(train_errors)))
+                            crrl_metrics["crrl/adaptive_estimator/train_rmse"] = float(
+                                np.sqrt(np.mean(np.square(train_errors)))
+                            )
+                            pred_std = float(train_predictions.std())
+                            target_std = float(train_target_values.std())
+                            if train_predictions.size > 1 and pred_std > 1e-8 and target_std > 1e-8:
+                                pearson = float(np.corrcoef(train_predictions, train_target_values)[0, 1])
+                            else:
+                                pearson = 0.0
+                            if not np.isfinite(pearson):
+                                pearson = 0.0
+                            crrl_metrics["crrl/adaptive_estimator/pred_target_pearson"] = pearson
+
+                            estimator_retrain_count = retrain_index
+                            crrl_metrics["crrl/adaptive_estimator/last_label_mean"] = float(train_target_values.mean())
+
+                            estimator_train_prompt_hidden_rows = []
+                            estimator_train_response_hidden_rows = []
+                            estimator_train_response_feature_rows = []
+                            estimator_train_targets = []
+                            estimator_retrain_steps = 0
+
+                    final_accumulation = None
+                    final_accumulation_estimator_rows = None
+                    target_accumulation_size = default_br_size
+                    seen_prompt_count = 0
+                    zero_adv_prompt_count = 0
+                    crrl_metrics["crrl/group_filter/next_br"] = float(default_br_size)
+                    micro_prompts = batch.non_tensor_batch.get("raw_prompt", None)
+                    micro_prompts = [_[0]["content"].strip() for _ in micro_prompts]
 
                     # update critic
                     if self.use_critic:
