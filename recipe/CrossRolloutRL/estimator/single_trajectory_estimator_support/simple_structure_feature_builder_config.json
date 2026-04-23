@@ -1,15 +1,15 @@
 {
   "prompt_hidden": {
     "input_field": "prompt_hidden_states",
-    "layer_index": 26,
+    "layer_index": 19,
     "pooling": {
       "type": "last_n_mean",
-      "n": 5
+      "n": 10
     }
   },
   "response_hidden": {
     "input_field": "response_hidden_states",
-    "layer_index": 26,
+    "layer_index": 19,
     "pooling": {
       "type": "last_n_mean",
       "n": 10
