@@ -732,6 +732,7 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         estimator_retrain_interval_steps = 4
         estimator_retrain_steps = 0
         estimator_retrain_count = 0
+        estimator_buffer_max_rows = 0
         estimator_train_prompt_hidden_rows: list[np.ndarray] = []
         estimator_train_response_hidden_rows: list[np.ndarray] = []
         estimator_train_response_feature_rows: list[dict[str, float]] = []
@@ -923,7 +924,8 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                 print(
                     "[DEBUG] Enabled CRRL estimator baseline: "
                     f"model={estimator_model_path}, pair_size={estimator_pair_size}, "
-                    f"hidden_source=pi_theta, retrain_interval_steps={estimator_retrain_interval_steps}, "
+                    f"hidden_source=pi_theta, buffer_top_n_steps={estimator_retrain_interval_steps}, "
+                    "update_every=1step, "
                     "persistence=checkpoint_only"
                 )
 
@@ -1315,78 +1317,93 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 estimator_train_targets.extend(
                                     float(v) for v in estimator_training_rows["targets"]
                                 )
-                                estimator_retrain_steps += 1
+                                step_row_count = len(estimator_training_rows["targets"])
+                                if step_row_count > 0 and estimator_buffer_max_rows <= 0:
+                                    # Keep roughly recent-N-steps worth of rows, where N=retrain_interval_steps.
+                                    estimator_buffer_max_rows = step_row_count * estimator_retrain_interval_steps
+
+                                if estimator_buffer_max_rows > 0 and len(estimator_train_targets) > estimator_buffer_max_rows:
+                                    # FIFO queue semantics: keep only the most recent rows.
+                                    keep_from = len(estimator_train_targets) - estimator_buffer_max_rows
+                                    estimator_train_prompt_hidden_rows = estimator_train_prompt_hidden_rows[keep_from:]
+                                    estimator_train_response_hidden_rows = estimator_train_response_hidden_rows[keep_from:]
+                                    estimator_train_response_feature_rows = estimator_train_response_feature_rows[
+                                        keep_from:
+                                    ]
+                                    estimator_train_targets = [float(v) for v in estimator_train_targets[keep_from:]]
+
+                                if step_row_count > 0:
+                                    estimator_retrain_steps = max(
+                                        1,
+                                        int(np.ceil(len(estimator_train_targets) / float(step_row_count))),
+                                    )
+                                else:
+                                    estimator_retrain_steps = 0
                                 crrl_metrics["crrl/adaptive_estimator/buffer_steps"] = float(estimator_retrain_steps)
                                 crrl_metrics["crrl/adaptive_estimator/buffer_rows"] = float(
                                     len(estimator_train_targets)
                                 )
+                                crrl_metrics["crrl/adaptive_estimator/buffer_capacity_rows"] = float(
+                                    estimator_buffer_max_rows
+                                )
 
-                                if estimator_retrain_steps >= estimator_retrain_interval_steps:
-                                    if estimator_fit_single_fn is None:
-                                        raise RuntimeError("Adaptive estimator retrain functions are not initialized.")
-                                    if estimator_fit_config is None or estimator_feature_builder_config is None:
-                                        raise RuntimeError("Adaptive estimator retrain config is not initialized.")
-                                    if not estimator_train_targets:
-                                        raise RuntimeError(
-                                            "Adaptive estimator retrain interval reached but no buffered rows exist."
+                                if estimator_fit_single_fn is None:
+                                    raise RuntimeError("Adaptive estimator retrain functions are not initialized.")
+                                if estimator_fit_config is None or estimator_feature_builder_config is None:
+                                    raise RuntimeError("Adaptive estimator retrain config is not initialized.")
+                                if not estimator_train_targets:
+                                    raise RuntimeError("Adaptive estimator retrain requires buffered rows.")
+
+                                train_target_values = np.asarray(estimator_train_targets, dtype=np.float32)
+                                retrain_index = estimator_retrain_count + 1
+
+                                bundle = estimator_fit_single_fn(
+                                    prompt_hidden_rows=estimator_train_prompt_hidden_rows,
+                                    response_hidden_rows=estimator_train_response_hidden_rows,
+                                    response_feature_rows=estimator_train_response_feature_rows,
+                                    targets=estimator_train_targets,
+                                    feature_builder_config=estimator_feature_builder_config,
+                                    fit_config=estimator_fit_config,
+                                )
+                                estimator = self._build_estimator_from_bundle(bundle)
+                                estimator_current_bundle = bundle
+                                estimator_current_model_path = None
+
+                                train_predictions = np.asarray(
+                                    [
+                                        estimator.predict_value(
+                                            prompt_hidden=prompt_hidden_row,
+                                            response_hidden=response_hidden_row,
+                                            response_features=response_feature_row,
                                         )
+                                        for prompt_hidden_row, response_hidden_row, response_feature_row in zip(
+                                            estimator_train_prompt_hidden_rows,
+                                            estimator_train_response_hidden_rows,
+                                            estimator_train_response_feature_rows,
+                                            strict=True,
+                                        )
+                                    ],
+                                    dtype=np.float32,
+                                )
+                                train_errors = train_predictions - train_target_values
+                                crrl_metrics["crrl/adaptive_estimator/train_mae"] = float(np.mean(np.abs(train_errors)))
+                                crrl_metrics["crrl/adaptive_estimator/train_rmse"] = float(
+                                    np.sqrt(np.mean(np.square(train_errors)))
+                                )
+                                pred_std = float(train_predictions.std())
+                                target_std = float(train_target_values.std())
+                                if train_predictions.size > 1 and pred_std > 1e-8 and target_std > 1e-8:
+                                    pearson = float(np.corrcoef(train_predictions, train_target_values)[0, 1])
+                                else:
+                                    pearson = 0.0
+                                if not np.isfinite(pearson):
+                                    pearson = 0.0
+                                crrl_metrics["crrl/adaptive_estimator/pred_target_pearson"] = pearson
 
-                                    train_target_values = np.asarray(estimator_train_targets, dtype=np.float32)
-                                    retrain_index = estimator_retrain_count + 1
-
-                                    bundle = estimator_fit_single_fn(
-                                        prompt_hidden_rows=estimator_train_prompt_hidden_rows,
-                                        response_hidden_rows=estimator_train_response_hidden_rows,
-                                        response_feature_rows=estimator_train_response_feature_rows,
-                                        targets=estimator_train_targets,
-                                        feature_builder_config=estimator_feature_builder_config,
-                                        fit_config=estimator_fit_config,
-                                    )
-                                    estimator = self._build_estimator_from_bundle(bundle)
-                                    estimator_current_bundle = bundle
-                                    estimator_current_model_path = None
-
-                                    train_predictions = np.asarray(
-                                        [
-                                            estimator.predict_value(
-                                                prompt_hidden=prompt_hidden_row,
-                                                response_hidden=response_hidden_row,
-                                                response_features=response_feature_row,
-                                            )
-                                            for prompt_hidden_row, response_hidden_row, response_feature_row in zip(
-                                                estimator_train_prompt_hidden_rows,
-                                                estimator_train_response_hidden_rows,
-                                                estimator_train_response_feature_rows,
-                                                strict=True,
-                                            )
-                                        ],
-                                        dtype=np.float32,
-                                    )
-                                    train_errors = train_predictions - train_target_values
-                                    crrl_metrics["crrl/adaptive_estimator/train_mae"] = float(np.mean(np.abs(train_errors)))
-                                    crrl_metrics["crrl/adaptive_estimator/train_rmse"] = float(
-                                        np.sqrt(np.mean(np.square(train_errors)))
-                                    )
-                                    pred_std = float(train_predictions.std())
-                                    target_std = float(train_target_values.std())
-                                    if train_predictions.size > 1 and pred_std > 1e-8 and target_std > 1e-8:
-                                        pearson = float(np.corrcoef(train_predictions, train_target_values)[0, 1])
-                                    else:
-                                        pearson = 0.0
-                                    if not np.isfinite(pearson):
-                                        pearson = 0.0
-                                    crrl_metrics["crrl/adaptive_estimator/pred_target_pearson"] = pearson
-
-                                    estimator_retrain_count = retrain_index
-                                    crrl_metrics["crrl/adaptive_estimator/last_label_mean"] = float(
-                                        train_target_values.mean()
-                                    )
-
-                                    estimator_train_prompt_hidden_rows = []
-                                    estimator_train_response_hidden_rows = []
-                                    estimator_train_response_feature_rows = []
-                                    estimator_train_targets = []
-                                    estimator_retrain_steps = 0
+                                estimator_retrain_count = retrain_index
+                                crrl_metrics["crrl/adaptive_estimator/last_label_mean"] = float(
+                                    train_target_values.mean()
+                                )
                             else:
                                 missing_baseline_count = 0
                                 baseline_values = []
