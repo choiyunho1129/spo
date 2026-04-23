@@ -21,6 +21,7 @@ class HiddenSequenceConfig:
 class RolloutScalarConfig:
     scalar_keys: tuple[str, ...]
     derived_scalar_keys: tuple[str, ...]
+    extra_scalar_field_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class FeatureBuilderConfig:
             rollout_scalars=RolloutScalarConfig(
                 scalar_keys=tuple(rollout_payload.get("scalar_keys", [])),
                 derived_scalar_keys=tuple(rollout_payload.get("derived_scalar_keys", [])),
+                extra_scalar_field_paths=tuple(rollout_payload.get("extra_scalar_field_paths", [])),
             ),
         )
 

@@ -533,6 +533,24 @@ class RayPPOTrainer(BaseRayPPOTrainer):
             return 0.0
         return float(values[clipped].mean())
 
+    @staticmethod
+    def _entropy_stats(values: np.ndarray, indices: list[int] | None = None) -> dict[str, float]:
+        if values.size == 0:
+            return {"mean": 0.0, "last": 0.0, "max": 0.0, "min": 0.0}
+        if indices is None:
+            selected = values
+        else:
+            clipped = [idx for idx in indices if 0 <= idx < values.shape[0]]
+            selected = values[clipped] if clipped else np.asarray([], dtype=values.dtype)
+        if selected.size == 0:
+            return {"mean": 0.0, "last": 0.0, "max": 0.0, "min": 0.0}
+        return {
+            "mean": float(selected.mean()),
+            "last": float(selected[-1]),
+            "max": float(selected.max()),
+            "min": float(selected.min()),
+        }
+
     def _find_reasoning_answer_spans(self, text: str) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
         reasoning_span = None
         answer_span = None
@@ -580,10 +598,6 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         response_ids: list[int],
         response_entropies: np.ndarray,
     ) -> dict[str, float]:
-        output_mean = float(response_entropies.mean()) if response_entropies.size > 0 else 0.0
-        reasoning_mean = 0.0
-        answer_mean = 0.0
-
         reasoning_indices: list[int] = []
         answer_indices: list[int] = []
         use_offset_fallback = False
@@ -610,12 +624,22 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         if use_offset_fallback:
             reasoning_indices, answer_indices = self._fallback_segment_indices(generated_text, len(response_ids))
 
-        reasoning_mean = self._mean_at_indices(response_entropies, reasoning_indices)
-        answer_mean = self._mean_at_indices(response_entropies, answer_indices)
+        output_stats = self._entropy_stats(response_entropies)
+        reasoning_stats = self._entropy_stats(response_entropies, reasoning_indices)
+        answer_stats = self._entropy_stats(response_entropies, answer_indices)
         return {
-            "output_mean_token_entropy": output_mean,
-            "reasoning_mean_token_entropy": reasoning_mean,
-            "answer_mean_token_entropy": answer_mean,
+            "output_mean_token_entropy": output_stats["mean"],
+            "output_last_token_entropy": output_stats["last"],
+            "output_max_token_entropy": output_stats["max"],
+            "output_min_token_entropy": output_stats["min"],
+            "reasoning_mean_token_entropy": reasoning_stats["mean"],
+            "reasoning_last_token_entropy": reasoning_stats["last"],
+            "reasoning_max_token_entropy": reasoning_stats["max"],
+            "reasoning_min_token_entropy": reasoning_stats["min"],
+            "answer_mean_token_entropy": answer_stats["mean"],
+            "answer_last_token_entropy": answer_stats["last"],
+            "answer_max_token_entropy": answer_stats["max"],
+            "answer_min_token_entropy": answer_stats["min"],
         }
 
     def _compute_estimator_cross_rollout_advantages(
@@ -627,9 +651,15 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         estimator,
         feature_builder,
         pair_size: int,
+        target_mode: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, list]]:
         if pair_size != 2:
             raise ValueError(f"Estimator cross-rollout advantage currently requires pair_size=2, got {pair_size}.")
+        if target_mode not in {"pair_average", "other_rollout_correctness"}:
+            raise ValueError(
+                "Estimator target_mode must be one of {'pair_average', 'other_rollout_correctness'}, "
+                f"got {target_mode!r}."
+            )
 
         prompt_hidden_key = "estimator_prompt_hidden"
         response_hidden_key = "estimator_response_hidden"
@@ -708,11 +738,17 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     f"uid={uid}, count={len(indices)}."
                 )
             first_idx, second_idx = indices
+            # Each prediction estimates the sibling rollout's reward/target, so it is used as
+            # the sibling row's baseline when computing advantages.
             cross_baselines[first_idx] = value_predictions[second_idx]
             cross_baselines[second_idx] = value_predictions[first_idx]
-            pair_avg_target = float(reward_sums[indices].to(torch.float32).mean().detach().cpu().item())
-            target_tensor[first_idx] = pair_avg_target
-            target_tensor[second_idx] = pair_avg_target
+            if target_mode == "pair_average":
+                pair_avg_target = float(reward_sums[indices].to(torch.float32).mean().detach().cpu().item())
+                target_tensor[first_idx] = pair_avg_target
+                target_tensor[second_idx] = pair_avg_target
+            else:
+                target_tensor[first_idx] = float(reward_sums[second_idx].to(torch.float32).detach().cpu().item())
+                target_tensor[second_idx] = float(reward_sums[first_idx].to(torch.float32).detach().cpu().item())
 
         raw_advantages = reward_sums.to(torch.float32) - cross_baselines.to(torch.float32)
         training_rows = {
@@ -955,6 +991,12 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                 with open(fit_config_path, encoding="utf-8") as f:
                     fit_payload = json.load(f)
                 estimator_fit_config = SingleTrajectoryEstimatorFitConfig(**fit_payload)
+                if estimator_fit_config.target_mode not in {"pair_average", "other_rollout_correctness"}:
+                    raise ValueError(
+                        "trainer.crrl.estimator.fit_config target_mode must be one of "
+                        "{'pair_average', 'other_rollout_correctness'}, "
+                        f"got {estimator_fit_config.target_mode!r}."
+                    )
                 estimator_fit_single_fn = fit_single_trajectory_estimator
 
                 if crrl_estimator_cfg.get("online_output_dir", None):
@@ -1323,39 +1365,42 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                         estimator=estimator,
                                         feature_builder=estimator_feature_builder,
                                         pair_size=estimator_pair_size,
+                                        target_mode=estimator_fit_config.target_mode,
                                     )
                                 )
                                 p_hats = p_hats.to(r)
                                 value_predictions = value_predictions.to(r)
-                                pair_avg_targets = torch.tensor(
+                                estimator_targets = torch.tensor(
                                     estimator_training_rows["targets"],
                                     dtype=torch.float32,
                                     device=value_predictions.device,
                                 )
 
                                 pred_values = value_predictions.to(torch.float32)
-                                pair_target_errors = pred_values - pair_avg_targets
-                                crrl_metrics["crrl/adaptive_estimator/online_pair_target_mae"] = float(
-                                    pair_target_errors.abs().mean().detach().cpu().item()
+                                target_errors = pred_values - estimator_targets
+                                crrl_metrics["crrl/adaptive_estimator/online_target_mae"] = float(
+                                    target_errors.abs().mean().detach().cpu().item()
                                 )
-                                crrl_metrics["crrl/adaptive_estimator/online_pair_target_rmse"] = float(
-                                    torch.sqrt(torch.mean(pair_target_errors.square())).detach().cpu().item()
+                                crrl_metrics["crrl/adaptive_estimator/online_target_rmse"] = float(
+                                    torch.sqrt(torch.mean(target_errors.square())).detach().cpu().item()
                                 )
-                                crrl_metrics["crrl/adaptive_estimator/online_pair_target_bias"] = float(
-                                    pair_target_errors.mean().detach().cpu().item()
+                                crrl_metrics["crrl/adaptive_estimator/online_target_bias"] = float(
+                                    target_errors.mean().detach().cpu().item()
                                 )
 
                                 pred_values_np = pred_values.detach().cpu().numpy().astype(np.float32, copy=False)
-                                pair_avg_targets_np = pair_avg_targets.detach().cpu().numpy().astype(np.float32, copy=False)
+                                estimator_targets_np = (
+                                    estimator_targets.detach().cpu().numpy().astype(np.float32, copy=False)
+                                )
                                 pred_std = float(pred_values_np.std())
-                                target_std = float(pair_avg_targets_np.std())
+                                target_std = float(estimator_targets_np.std())
                                 if pred_values_np.size > 1 and pred_std > 1e-8 and target_std > 1e-8:
-                                    online_pair_pearson = float(np.corrcoef(pred_values_np, pair_avg_targets_np)[0, 1])
+                                    online_target_pearson = float(np.corrcoef(pred_values_np, estimator_targets_np)[0, 1])
                                 else:
-                                    online_pair_pearson = 0.0
-                                if not np.isfinite(online_pair_pearson):
-                                    online_pair_pearson = 0.0
-                                crrl_metrics["crrl/adaptive_estimator/online_pair_target_pearson"] = online_pair_pearson
+                                    online_target_pearson = 0.0
+                                if not np.isfinite(online_target_pearson):
+                                    online_target_pearson = 0.0
+                                crrl_metrics["crrl/adaptive_estimator/online_target_pearson"] = online_target_pearson
 
                                 uid_to_indices_for_metric: dict[str, list[int]] = defaultdict(list)
                                 for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
@@ -1366,9 +1411,11 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                     if len(indices) != estimator_pair_size:
                                         continue
                                     first_idx, second_idx = indices
-                                    pred_diff = float(
-                                        (value_predictions[first_idx] - value_predictions[second_idx]).detach().cpu().item()
-                                    )
+                                    if estimator_fit_config.target_mode == "other_rollout_correctness":
+                                        pred_diff_tensor = value_predictions[second_idx] - value_predictions[first_idx]
+                                    else:
+                                        pred_diff_tensor = value_predictions[first_idx] - value_predictions[second_idx]
+                                    pred_diff = float(pred_diff_tensor.detach().cpu().item())
                                     reward_diff = float((r[first_idx] - r[second_idx]).detach().cpu().item())
                                     pred_sign = np.sign(pred_diff)
                                     reward_sign = np.sign(reward_diff)

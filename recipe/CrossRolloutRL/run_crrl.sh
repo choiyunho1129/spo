@@ -25,9 +25,9 @@ DEBUG=${DEBUG:-"False"}
 #estimator config
 CRRL_MODE=${CRRL_MODE:-"adaptive_estimator"} # non_adaptive_estimator | adaptive_estimator
 BASELINE_VALUES=${BASELINE_VALUES:-"data/dapo_math_17k_baseline.jsonl"}
-ESTIMATOR_MODEL_PATH=${ESTIMATOR_MODEL_PATH:-"recipe/CrossRolloutRL/estimator/artifacts/qwen3_4b_subset0_1_temp1_pairavg_estimator.joblib"}
-ESTIMATOR_FEATURE_BUILDER_CONFIG=${ESTIMATOR_FEATURE_BUILDER_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_feature_builder_config.json"}
-ESTIMATOR_FIT_CONFIG=${ESTIMATOR_FIT_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_estimator_fit_config.json"}
+ESTIMATOR_MODEL_PATH=${ESTIMATOR_MODEL_PATH:-"recipe/CrossRolloutRL/estimator/artifacts/qwen3_4b_simple_structure_other_rollout_estimator.joblib"}
+ESTIMATOR_FEATURE_BUILDER_CONFIG=${ESTIMATOR_FEATURE_BUILDER_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/simple_structure_feature_builder_config.json"}
+ESTIMATOR_FIT_CONFIG=${ESTIMATOR_FIT_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/simple_structure_estimator_fit_config.json"}
 ESTIMATOR_PAIR_SIZE=${ESTIMATOR_PAIR_SIZE:-2}
 ESTIMATOR_RETRAIN_INTERVAL_STEPS=${ESTIMATOR_RETRAIN_INTERVAL_STEPS:-4}
 CRRL_MISSING_PROMPT=${CRRL_MISSING_PROMPT:-"default"} # error | default
