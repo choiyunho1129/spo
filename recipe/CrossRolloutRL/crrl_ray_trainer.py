@@ -833,6 +833,7 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         estimator_retrain_interval_steps = 4
         estimator_retrain_steps = 0
         estimator_retrain_count = 0
+        estimator_buffer_max_rows = 0
         estimator_train_prompt_hidden_rows: list[np.ndarray] = []
         estimator_train_response_hidden_rows: list[np.ndarray] = []
         estimator_train_response_feature_rows: list[dict[str, float]] = []
@@ -1030,7 +1031,8 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                 print(
                     "[DEBUG] Enabled CRRL estimator baseline: "
                     f"model={estimator_model_path}, pair_size={estimator_pair_size}, "
-                    f"hidden_source=pi_theta, retrain_interval_steps={estimator_retrain_interval_steps}, "
+                    f"hidden_source=pi_theta, buffer_top_n_steps={estimator_retrain_interval_steps}, "
+                    "update_every=1step, "
                     "persistence=checkpoint_only"
                 )
 
