@@ -664,7 +664,7 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
             uid_to_indices[str(uid)].append(idx)
 
-        baselines = torch.zeros_like(value_predictions)
+        cross_baselines = torch.zeros_like(value_predictions)
         target_tensor = torch.zeros(batch_size, dtype=torch.float32)
         for uid, indices in uid_to_indices.items():
             if len(indices) != pair_size:
@@ -673,26 +673,26 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     f"uid={uid}, count={len(indices)}."
                 )
             first_idx, second_idx = indices
+            # Each prediction estimates the sibling rollout's reward/target, so it is used as
+            # the sibling row's baseline when computing advantages.
+            cross_baselines[first_idx] = value_predictions[second_idx]
+            cross_baselines[second_idx] = value_predictions[first_idx]
             if target_mode == "pair_average":
-                baselines[first_idx] = value_predictions[second_idx]
-                baselines[second_idx] = value_predictions[first_idx]
                 pair_avg_target = float(reward_sums[indices].to(torch.float32).mean().detach().cpu().item())
                 target_tensor[first_idx] = pair_avg_target
                 target_tensor[second_idx] = pair_avg_target
             else:
-                baselines[first_idx] = value_predictions[first_idx]
-                baselines[second_idx] = value_predictions[second_idx]
                 target_tensor[first_idx] = float(reward_sums[second_idx].to(torch.float32).detach().cpu().item())
                 target_tensor[second_idx] = float(reward_sums[first_idx].to(torch.float32).detach().cpu().item())
 
-        raw_advantages = reward_sums.to(torch.float32) - baselines.to(torch.float32)
+        raw_advantages = reward_sums.to(torch.float32) - cross_baselines.to(torch.float32)
         training_rows = {
             "prompt_hidden_rows": prompt_hidden_rows,
             "response_hidden_rows": response_hidden_rows,
             "response_feature_rows": response_feature_rows,
             "targets": target_tensor.tolist(),
         }
-        return raw_advantages, baselines, value_predictions, training_rows
+        return raw_advantages, cross_baselines, value_predictions, training_rows
 
     def fit(self):
         """
