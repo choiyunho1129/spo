@@ -170,8 +170,10 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
             uid_str = str(uid)
             abs_adv = float(abs(seq_adv_np[idx]))
-            prev = uid_abs_max_adv.get(uid_str, 0.0)
-            if abs_adv > prev:
+            if not np.isfinite(abs_adv):
+                abs_adv = 0.0
+            prev = uid_abs_max_adv.get(uid_str)
+            if prev is None or abs_adv > prev:
                 uid_abs_max_adv[uid_str] = abs_adv
 
         kept_prompt_uids = {
@@ -830,10 +832,10 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         estimator_current_bundle = None
         estimator_pair_size = 2
         estimator_capture_spec = None
-        estimator_retrain_interval_steps = 4
+        estimator_warmup_steps = 4
         estimator_retrain_steps = 0
         estimator_retrain_count = 0
-        estimator_buffer_max_rows = 0
+        estimator_buffer_max_rows = 4096
         estimator_train_prompt_hidden_rows: list[np.ndarray] = []
         estimator_train_response_hidden_rows: list[np.ndarray] = []
         estimator_train_response_feature_rows: list[dict[str, float]] = []
@@ -978,11 +980,17 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                 estimator_feature_builder = SingleTrajectoryFeatureBuilder(feature_builder_config)
                 estimator_feature_builder_config = feature_builder_config
                 estimator_pair_size = int(crrl_estimator_cfg.get("pair_size", 2))
-                estimator_retrain_interval_steps = int(crrl_estimator_cfg.get("retrain_interval_steps", 4))
-                if estimator_retrain_interval_steps <= 0:
+                estimator_warmup_steps = int(crrl_estimator_cfg.get("warmup_steps", 4))
+                if estimator_warmup_steps <= 0:
                     raise ValueError(
-                        "trainer.crrl.estimator.retrain_interval_steps must be a positive integer, "
-                        f"got {estimator_retrain_interval_steps}."
+                        "trainer.crrl.estimator.warmup_steps must be a positive integer, "
+                        f"got {estimator_warmup_steps}."
+                    )
+                estimator_buffer_max_rows = int(crrl_estimator_cfg.get("buffer_max_rows", 4096))
+                if estimator_buffer_max_rows <= 0:
+                    raise ValueError(
+                        "trainer.crrl.estimator.buffer_max_rows must be a positive integer, "
+                        f"got {estimator_buffer_max_rows}."
                     )
 
                 fit_config_path = crrl_estimator_cfg.get(
@@ -1031,8 +1039,9 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                 print(
                     "[DEBUG] Enabled CRRL estimator baseline: "
                     f"model={estimator_model_path}, pair_size={estimator_pair_size}, "
-                    f"hidden_source=pi_theta, buffer_top_n_steps={estimator_retrain_interval_steps}, "
-                    "update_every=1step, "
+                    f"hidden_source=pi_theta, warmup_steps={estimator_warmup_steps}, "
+                    f"fifo_max_rows={estimator_buffer_max_rows}, "
+                    "update_every=1step_after_warmup, "
                     "persistence=checkpoint_only"
                 )
 
@@ -1076,6 +1085,17 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                             f"prompt={prompt_rows_len}, response={response_rows_len}, "
                             f"feature={feature_rows_len}, targets={target_rows_len}"
                         )
+                    if target_rows_len > estimator_buffer_max_rows:
+                        start_idx = target_rows_len - estimator_buffer_max_rows
+                        estimator_train_prompt_hidden_rows = estimator_train_prompt_hidden_rows[start_idx:]
+                        estimator_train_response_hidden_rows = estimator_train_response_hidden_rows[start_idx:]
+                        estimator_train_response_feature_rows = estimator_train_response_feature_rows[start_idx:]
+                        estimator_train_targets = estimator_train_targets[start_idx:]
+                        target_rows_len = len(estimator_train_targets)
+                        print(
+                            "[DEBUG] Trimmed restored adaptive estimator FIFO buffer to "
+                            f"{target_rows_len} rows (max={estimator_buffer_max_rows})."
+                        )
                     print(
                         "[DEBUG] Restored adaptive estimator state from checkpoint: "
                         f"retrain_steps={estimator_retrain_steps}, retrain_count={estimator_retrain_count}, "
@@ -1115,6 +1135,11 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         target_accumulation_size = default_br_size
         seen_prompt_count = 0
         zero_adv_prompt_count = 0
+        group_filter_round_count = 0
+        group_filter_generated_prompts_total = 0
+        group_filter_round_generated_prompt_counts: list[int] = []
+        group_filter_reward_sum = 0.0
+        group_filter_reward_count = 0
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1193,6 +1218,10 @@ class RayPPOTrainer(BaseRayPPOTrainer):
 
                 batch = pre_filter_buffer
                 pre_filter_buffer = None
+                current_round_prompt_count = len(set(batch.non_tensor_batch["uid"]))
+                group_filter_round_count += 1
+                group_filter_generated_prompts_total += current_round_prompt_count
+                group_filter_round_generated_prompt_counts.append(current_round_prompt_count)
 
                 metrics = {}
                 timing_raw = {}
@@ -1356,7 +1385,8 @@ class RayPPOTrainer(BaseRayPPOTrainer):
 
                         if self.config.trainer.crrl.enable:
                             r = reward_tensor.sum(dim=-1)
-                            crrl_metrics["crrl/reward"] = r.mean().detach().item()
+                            group_filter_reward_sum += float(r.to(torch.float32).sum().detach().cpu().item())
+                            group_filter_reward_count += int(r.numel())
 
                             if estimator_enabled:
                                 raw_advantages, p_hats, value_predictions, estimator_training_rows = (
@@ -1516,6 +1546,9 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         if final_accumulation is None:
                             final_accumulation = filtered_batch
                         else:
+                            filtered_batch.meta_info.pop("global_token_num", None)
+                            if final_accumulation is not None:
+                                final_accumulation.meta_info.pop("global_token_num", None)
                             final_accumulation = DataProto.concat([final_accumulation, filtered_batch])
                         if estimator_enabled:
                             if estimator_training_rows is None:
@@ -1561,10 +1594,20 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     alpha = zero_adv_prompt_count / seen_prompt_count if seen_prompt_count > 0 else 0.0
                     crrl_metrics["crrl/group_filter/alpha"] = float(alpha)
                     crrl_metrics["crrl/group_filter/default_br_size"] = float(default_br_size)
-                    crrl_metrics["crrl/group_filter/seen_prompts_pool"] = float(seen_prompts_in_pool)
-                    crrl_metrics["crrl/group_filter/zero_adv_prompts_pool"] = float(zero_prompts_in_pool)
-                    crrl_metrics["crrl/group_filter/kept_prompts_pool"] = float(kept_prompts_in_pool)
-                    crrl_metrics["crrl/group_filter/effective_prompts_total"] = float(num_final_prompts)
+                    crrl_metrics["crrl/group_filter/seen_prompts_total"] = float(seen_prompt_count)
+                    crrl_metrics["crrl/group_filter/zero_adv_prompts_total"] = float(zero_adv_prompt_count)
+                    crrl_metrics["crrl/group_filter/kept_prompts_total"] = float(
+                        seen_prompt_count - zero_adv_prompt_count
+                    )
+                    crrl_metrics["crrl/group_filter/rounds_total"] = float(group_filter_round_count)
+                    crrl_metrics["crrl/group_filter/generated_prompts_total"] = float(
+                        group_filter_generated_prompts_total
+                    )
+                    crrl_metrics["crrl/group_filter/generated_prompts_round_current"] = float(
+                        current_round_prompt_count
+                    )
+                    for round_idx, prompt_count in enumerate(group_filter_round_generated_prompt_counts, start=1):
+                        crrl_metrics[f"crrl/group_filter/round_{round_idx}_generated_prompts"] = float(prompt_count)
 
                     if num_final_prompts < target_prompt_batch_size:
                         batch_delta = target_prompt_batch_size - num_final_prompts
@@ -1572,7 +1615,6 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         next_target = min(default_br_size, estimated_br)
                         next_target = max(1, next_target)
                         target_accumulation_size = next_target
-                        crrl_metrics["crrl/group_filter/next_br"] = float(next_target)
                         print(
                             "[CRRL][GroupFilter] "
                             f"effective={num_final_prompts}/{target_prompt_batch_size}, "
@@ -1594,6 +1636,16 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         continue
 
                     batch = final_accumulation[:target_traj_batch_size]
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    if self.config.trainer.crrl.enable:
+                        if group_filter_reward_count > 0:
+                            crrl_metrics["crrl/reward"] = float(group_filter_reward_sum / group_filter_reward_count)
+                        else:
+                            crrl_metrics["crrl/reward"] = 0.0
+                        final_batch_rewards = batch.batch["token_level_scores"].sum(dim=-1).to(torch.float32)
+                        crrl_metrics["crrl/reward_final_batch"] = float(
+                            final_batch_rewards.mean().detach().cpu().item()
+                        )
                     if estimator_enabled:
                         if final_accumulation_estimator_rows is None:
                             raise RuntimeError(
@@ -1629,10 +1681,28 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         estimator_train_response_feature_rows.extend(final_response_feature_rows)
                         estimator_train_targets.extend(float(v) for v in final_targets)
                         estimator_retrain_steps += 1
-                        crrl_metrics["crrl/adaptive_estimator/buffer_steps"] = float(estimator_retrain_steps)
+                        fifo_trimmed_rows = 0
+                        if len(estimator_train_targets) > estimator_buffer_max_rows:
+                            fifo_trimmed_rows = len(estimator_train_targets) - estimator_buffer_max_rows
+                            estimator_train_prompt_hidden_rows = estimator_train_prompt_hidden_rows[
+                                -estimator_buffer_max_rows:
+                            ]
+                            estimator_train_response_hidden_rows = estimator_train_response_hidden_rows[
+                                -estimator_buffer_max_rows:
+                            ]
+                            estimator_train_response_feature_rows = estimator_train_response_feature_rows[
+                                -estimator_buffer_max_rows:
+                            ]
+                            estimator_train_targets = estimator_train_targets[-estimator_buffer_max_rows:]
                         crrl_metrics["crrl/adaptive_estimator/buffer_rows"] = float(len(estimator_train_targets))
+                        crrl_metrics["crrl/adaptive_estimator/fifo_max_rows"] = float(estimator_buffer_max_rows)
+                        crrl_metrics["crrl/adaptive_estimator/fifo_trimmed_rows"] = float(fifo_trimmed_rows)
+                        crrl_metrics["crrl/adaptive_estimator/warmup_steps"] = float(estimator_warmup_steps)
+                        crrl_metrics["crrl/adaptive_estimator/warmup_remaining_steps"] = float(
+                            max(0, estimator_warmup_steps - estimator_retrain_steps)
+                        )
 
-                        if estimator_retrain_steps >= estimator_retrain_interval_steps:
+                        if estimator_retrain_steps >= estimator_warmup_steps:
                             if estimator_fit_single_fn is None:
                                 raise RuntimeError("Adaptive estimator retrain functions are not initialized.")
                             if estimator_fit_config is None or estimator_feature_builder_config is None:
@@ -1690,19 +1760,20 @@ class RayPPOTrainer(BaseRayPPOTrainer):
 
                             estimator_retrain_count = retrain_index
                             crrl_metrics["crrl/adaptive_estimator/last_label_mean"] = float(train_target_values.mean())
-
-                            estimator_train_prompt_hidden_rows = []
-                            estimator_train_response_hidden_rows = []
-                            estimator_train_response_feature_rows = []
-                            estimator_train_targets = []
-                            estimator_retrain_steps = 0
+                            crrl_metrics["crrl/adaptive_estimator/window_rows_used_for_fit"] = float(
+                                len(estimator_train_targets)
+                            )
 
                     final_accumulation = None
                     final_accumulation_estimator_rows = None
                     target_accumulation_size = default_br_size
                     seen_prompt_count = 0
                     zero_adv_prompt_count = 0
-                    crrl_metrics["crrl/group_filter/next_br"] = float(default_br_size)
+                    group_filter_round_count = 0
+                    group_filter_generated_prompts_total = 0
+                    group_filter_round_generated_prompt_counts = []
+                    group_filter_reward_sum = 0.0
+                    group_filter_reward_count = 0
                     micro_prompts = batch.non_tensor_batch.get("raw_prompt", None)
                     micro_prompts = [_[0]["content"].strip() for _ in micro_prompts]
 

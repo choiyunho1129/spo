@@ -16,7 +16,7 @@ export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_DIR}/wandb"}
 #base config
 OUTPUT_DIR=${OUTPUT_DIR:-"crrl_verl_pr"}
 TRAIN_DATA_DIR=${TRAIN_DATA_DIR:-"data/DAPO-Math-17k-Processed_Splits"}
-EXP_NAME=${EXP_NAME:-"Qwen3-4B_CRRL_batch_1024_B200"}
+EXP_NAME=${EXP_NAME:-"Qwen3-4B_CRRL_batch_512_B200_dynamic_sampling"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
 N_VAL=${N_VAL:-8}
@@ -25,11 +25,11 @@ DEBUG=${DEBUG:-"False"}
 #estimator config
 CRRL_MODE=${CRRL_MODE:-"adaptive_estimator"} # non_adaptive_estimator | adaptive_estimator
 BASELINE_VALUES=${BASELINE_VALUES:-"data/dapo_math_17k_baseline.jsonl"}
-ESTIMATOR_MODEL_PATH=${ESTIMATOR_MODEL_PATH:-"recipe/CrossRolloutRL/estimator/artifacts/qwen3_4b_simple_structure_other_rollout_estimator.joblib"}
+ESTIMATOR_MODEL_PATH=${ESTIMATOR_MODEL_PATH:-"recipe/CrossRolloutRL/estimator/artifacts/initial_estimator.joblib"}
 ESTIMATOR_FEATURE_BUILDER_CONFIG=${ESTIMATOR_FEATURE_BUILDER_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/simple_structure_feature_builder_config.json"}
 ESTIMATOR_FIT_CONFIG=${ESTIMATOR_FIT_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/simple_structure_estimator_fit_config.json"}
 ESTIMATOR_PAIR_SIZE=${ESTIMATOR_PAIR_SIZE:-2}
-ESTIMATOR_RETRAIN_INTERVAL_STEPS=${ESTIMATOR_RETRAIN_INTERVAL_STEPS:-4}
+ESTIMATOR_WARMUP_STEPS=${ESTIMATOR_WARMUP_STEPS:-8}
 CRRL_MISSING_PROMPT=${CRRL_MISSING_PROMPT:-"default"} # error | default
 CRRL_DEFAULT_P_HAT=${CRRL_DEFAULT_P_HAT:-0.5}
 CRRL_WEIGHTED_SAMPLING=${CRRL_WEIGHTED_SAMPLING:-"False"}
@@ -75,11 +75,11 @@ reward_manager=naive
 
 n_resp_per_prompt=2
 n_resp_per_prompt_val=$N_VAL
-train_batch_size=512
-ppo_mini_batch_size=64
+train_batch_size=256
+ppo_mini_batch_size=128
 val_batch_size=128
 gen_batch_size=8 
-CRRL_DEFAULT_BR_SIZE=${CRRL_DEFAULT_BR_SIZE:-768}
+CRRL_DEFAULT_BR_SIZE=${CRRL_DEFAULT_BR_SIZE:-384}
 CRRL_BETA=${CRRL_BETA:-1.25}
 CRRL_ADVANTAGE_ZERO_EPS=${CRRL_ADVANTAGE_ZERO_EPS:-1e-8}
 crrl_enable=True
@@ -170,7 +170,7 @@ python3 -m recipe.CrossRolloutRL.crrl_main_ppo \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
-    actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \-
+    actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
     trainer.logger=['console','wandb'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
@@ -193,5 +193,5 @@ python3 -m recipe.CrossRolloutRL.crrl_main_ppo \
     trainer.crrl.estimator.feature_builder_config_path=$ESTIMATOR_FEATURE_BUILDER_CONFIG \
     trainer.crrl.estimator.fit_config_path=$ESTIMATOR_FIT_CONFIG \
     trainer.crrl.estimator.pair_size=$ESTIMATOR_PAIR_SIZE \
-    trainer.crrl.estimator.retrain_interval_steps=$ESTIMATOR_RETRAIN_INTERVAL_STEPS \
+    trainer.crrl.estimator.warmup_steps=$ESTIMATOR_WARMUP_STEPS \
     trainer.debug=$DEBUG  \

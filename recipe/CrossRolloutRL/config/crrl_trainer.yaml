@@ -22,6 +22,6 @@ trainer:
       feature_builder_config_path: "recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_feature_builder_config.json"
       pair_size: 2
       fit_config_path: "recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_estimator_fit_config.json"
-      retrain_interval_steps: 4
+      warmup_steps: 4
       online_output_dir: null
       log_rows_on_retrain: true
