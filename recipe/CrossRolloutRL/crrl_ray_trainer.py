@@ -187,6 +187,53 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         return kept_indices, total_prompt_count, kept_prompt_count
 
     @staticmethod
+    def _sample_full_prompt_indices(
+        batch: DataProto, *, target_prompt_count: int, rollout_repeat: int
+    ) -> list[int]:
+        if "uid" not in batch.non_tensor_batch:
+            raise KeyError("Prompt-level sampling requires non_tensor field 'uid'.")
+        if target_prompt_count <= 0:
+            raise ValueError(f"target_prompt_count must be positive, got {target_prompt_count}")
+        if rollout_repeat <= 0:
+            raise ValueError(f"rollout_repeat must be positive, got {rollout_repeat}")
+
+        uid_to_indices: dict[str, list[int]] = {}
+        for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+            uid_to_indices.setdefault(str(uid), []).append(idx)
+
+        malformed = {
+            uid: len(indices)
+            for uid, indices in uid_to_indices.items()
+            if len(indices) != rollout_repeat
+        }
+        if malformed:
+            preview = list(malformed.items())[:5]
+            raise ValueError(
+                "Final CRRL batch sampling requires each prompt to have exactly "
+                f"{rollout_repeat} trajectories, but found malformed counts: {preview}"
+            )
+
+        prompt_uids = np.array(list(uid_to_indices.keys()), dtype=object)
+        if prompt_uids.size < target_prompt_count:
+            raise ValueError(
+                "Not enough kept prompts to build the final CRRL batch: "
+                f"kept={prompt_uids.size}, target={target_prompt_count}"
+            )
+
+        selected_positions = np.random.choice(prompt_uids.size, size=target_prompt_count, replace=False)
+        selected_indices: list[int] = []
+        for pos in selected_positions.tolist():
+            selected_indices.extend(uid_to_indices[str(prompt_uids[pos])])
+
+        expected_traj_count = target_prompt_count * rollout_repeat
+        if len(selected_indices) != expected_traj_count:
+            raise RuntimeError(
+                "Prompt-level sampling produced an unexpected number of trajectories: "
+                f"selected={len(selected_indices)}, expected={expected_traj_count}"
+            )
+        return selected_indices
+
+    @staticmethod
     def _runtime_estimator_to_bundle(estimator) -> dict:
         return {
             "bundle_type": "single_trajectory_estimator",
@@ -1140,6 +1187,8 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         group_filter_round_generated_prompt_counts: list[int] = []
         group_filter_reward_sum = 0.0
         group_filter_reward_count = 0
+        group_filter_p_hat_sum = 0.0
+        group_filter_p_hat_count = 0
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1499,7 +1548,10 @@ class RayPPOTrainer(BaseRayPPOTrainer):
 
                             raw_advantages_float = raw_advantages.to(torch.float32)
                             raw_advantages_var = float(raw_advantages_float.var(unbiased=False).detach().cpu().item())
-                            crrl_metrics["crrl/p_hats"] = p_hats.mean().detach().item()
+                            p_hats_float = p_hats.to(torch.float32)
+                            group_filter_p_hat_sum += float(p_hats_float.sum().detach().cpu().item())
+                            group_filter_p_hat_count += int(p_hats_float.numel())
+                            batch.batch["crrl_p_hats"] = p_hats_float.to(raw_advantages.device)
                             crrl_metrics["crrl/adv_before_norm"] = raw_advantages.mean().detach().item()
                             crrl_metrics["crrl/raw_advantages/var"] = raw_advantages_var
                             # Group filtering should use raw (pre-normalized) sequence advantages.
@@ -1635,9 +1687,16 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                             curr_step_profile = next_step_profile
                         continue
 
-                    batch = final_accumulation[:target_traj_batch_size]
+                    final_sample_indices = self._sample_full_prompt_indices(
+                        final_accumulation,
+                        target_prompt_count=target_prompt_batch_size,
+                        rollout_repeat=rollout_repeat,
+                    )
+                    batch = final_accumulation[final_sample_indices]
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     if self.config.trainer.crrl.enable:
+                        crrl_metrics["crrl/group_filter/final_sampled_prompts"] = float(target_prompt_batch_size)
+                        crrl_metrics["crrl/group_filter/final_sampled_trajectories"] = float(target_traj_batch_size)
                         if group_filter_reward_count > 0:
                             crrl_metrics["crrl/reward"] = float(group_filter_reward_sum / group_filter_reward_count)
                         else:
@@ -1646,22 +1705,36 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         crrl_metrics["crrl/reward_final_batch"] = float(
                             final_batch_rewards.mean().detach().cpu().item()
                         )
+                        if group_filter_p_hat_count > 0:
+                            crrl_metrics["crrl/p_hats"] = float(group_filter_p_hat_sum / group_filter_p_hat_count)
+                        else:
+                            crrl_metrics["crrl/p_hats"] = 0.0
+                        final_batch_p_hats = batch.batch["crrl_p_hats"].to(torch.float32)
+                        crrl_metrics["crrl/p_hats_final_batch"] = float(
+                            final_batch_p_hats.mean().detach().cpu().item()
+                        )
                     if estimator_enabled:
                         if final_accumulation_estimator_rows is None:
                             raise RuntimeError(
                                 "Estimator is enabled but no filtered estimator rows were accumulated for final batch."
                             )
 
-                        final_prompt_hidden_rows = final_accumulation_estimator_rows["prompt_hidden_rows"][
-                            :target_traj_batch_size
+                        final_prompt_hidden_rows = [
+                            final_accumulation_estimator_rows["prompt_hidden_rows"][idx]
+                            for idx in final_sample_indices
                         ]
-                        final_response_hidden_rows = final_accumulation_estimator_rows["response_hidden_rows"][
-                            :target_traj_batch_size
+                        final_response_hidden_rows = [
+                            final_accumulation_estimator_rows["response_hidden_rows"][idx]
+                            for idx in final_sample_indices
                         ]
-                        final_response_feature_rows = final_accumulation_estimator_rows["response_feature_rows"][
-                            :target_traj_batch_size
+                        final_response_feature_rows = [
+                            final_accumulation_estimator_rows["response_feature_rows"][idx]
+                            for idx in final_sample_indices
                         ]
-                        final_targets = final_accumulation_estimator_rows["targets"][:target_traj_batch_size]
+                        final_targets = [
+                            final_accumulation_estimator_rows["targets"][idx]
+                            for idx in final_sample_indices
+                        ]
 
                         final_row_count = len(final_targets)
                         if not (
@@ -1774,6 +1847,8 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     group_filter_round_generated_prompt_counts = []
                     group_filter_reward_sum = 0.0
                     group_filter_reward_count = 0
+                    group_filter_p_hat_sum = 0.0
+                    group_filter_p_hat_count = 0
                     micro_prompts = batch.non_tensor_batch.get("raw_prompt", None)
                     micro_prompts = [_[0]["content"].strip() for _ in micro_prompts]
 
