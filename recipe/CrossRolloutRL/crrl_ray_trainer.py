@@ -1259,7 +1259,13 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                 if pre_filter_buffer is None:
                     pre_filter_buffer = new_batch
                 else:
-                    pre_filter_buffer = DataProto.concat([pre_filter_buffer, new_batch])
+                    existing_uids = set(pre_filter_buffer.non_tensor_batch["uid"])
+                    unique_indices = [
+                        i for i, uid in enumerate(new_batch.non_tensor_batch["uid"])
+                        if uid not in existing_uids
+                    ]
+                    if unique_indices:
+                        pre_filter_buffer = DataProto.concat([pre_filter_buffer, new_batch[unique_indices]])
 
                 current_prompt_pool_size = len(set(pre_filter_buffer.non_tensor_batch["uid"]))
                 if current_prompt_pool_size < target_accumulation_size:
@@ -1595,19 +1601,12 @@ class RayPPOTrainer(BaseRayPPOTrainer):
 
                     if kept_traj_indices:
                         filtered_batch = batch[kept_traj_indices]
-                        if final_accumulation is None:
-                            final_accumulation = filtered_batch
-                        else:
-                            filtered_batch.meta_info.pop("global_token_num", None)
-                            if final_accumulation is not None:
-                                final_accumulation.meta_info.pop("global_token_num", None)
-                            final_accumulation = DataProto.concat([final_accumulation, filtered_batch])
+
                         if estimator_enabled:
                             if estimator_training_rows is None:
                                 raise RuntimeError(
                                     "Estimator is enabled but estimator_training_rows is missing before filtering."
                                 )
-
                             filtered_prompt_hidden_rows = [
                                 estimator_training_rows["prompt_hidden_rows"][idx] for idx in kept_traj_indices
                             ]
@@ -1619,29 +1618,53 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                             ]
                             filtered_targets = [estimator_training_rows["targets"][idx] for idx in kept_traj_indices]
 
-                            if final_accumulation_estimator_rows is None:
-                                final_accumulation_estimator_rows = {
-                                    "prompt_hidden_rows": filtered_prompt_hidden_rows,
-                                    "response_hidden_rows": filtered_response_hidden_rows,
-                                    "response_feature_rows": filtered_response_feature_rows,
-                                    "targets": filtered_targets,
-                                }
+                        if final_accumulation is not None:
+                            existing_final_uids = set(final_accumulation.non_tensor_batch["uid"])
+                            dedup_indices = [
+                                i for i, uid in enumerate(filtered_batch.non_tensor_batch["uid"])
+                                if uid not in existing_final_uids
+                            ]
+                            if dedup_indices:
+                                filtered_batch = filtered_batch[dedup_indices]
+                                if estimator_enabled:
+                                    filtered_prompt_hidden_rows = [filtered_prompt_hidden_rows[i] for i in dedup_indices]
+                                    filtered_response_hidden_rows = [filtered_response_hidden_rows[i] for i in dedup_indices]
+                                    filtered_response_feature_rows = [filtered_response_feature_rows[i] for i in dedup_indices]
+                                    filtered_targets = [filtered_targets[i] for i in dedup_indices]
                             else:
-                                final_accumulation_estimator_rows["prompt_hidden_rows"].extend(
-                                    filtered_prompt_hidden_rows
-                                )
-                                final_accumulation_estimator_rows["response_hidden_rows"].extend(
-                                    filtered_response_hidden_rows
-                                )
-                                final_accumulation_estimator_rows["response_feature_rows"].extend(
-                                    filtered_response_feature_rows
-                                )
-                                final_accumulation_estimator_rows["targets"].extend(filtered_targets)
-                        num_final_prompts = len(set(final_accumulation.non_tensor_batch["uid"]))
-                    else:
-                        num_final_prompts = (
-                            len(set(final_accumulation.non_tensor_batch["uid"])) if final_accumulation is not None else 0
-                        )
+                                filtered_batch = None
+
+                        if filtered_batch is not None:
+                            if final_accumulation is None:
+                                final_accumulation = filtered_batch
+                            else:
+                                filtered_batch.meta_info.pop("global_token_num", None)
+                                final_accumulation.meta_info.pop("global_token_num", None)
+                                final_accumulation = DataProto.concat([final_accumulation, filtered_batch])
+
+                            if estimator_enabled:
+                                if final_accumulation_estimator_rows is None:
+                                    final_accumulation_estimator_rows = {
+                                        "prompt_hidden_rows": filtered_prompt_hidden_rows,
+                                        "response_hidden_rows": filtered_response_hidden_rows,
+                                        "response_feature_rows": filtered_response_feature_rows,
+                                        "targets": filtered_targets,
+                                    }
+                                else:
+                                    final_accumulation_estimator_rows["prompt_hidden_rows"].extend(
+                                        filtered_prompt_hidden_rows
+                                    )
+                                    final_accumulation_estimator_rows["response_hidden_rows"].extend(
+                                        filtered_response_hidden_rows
+                                    )
+                                    final_accumulation_estimator_rows["response_feature_rows"].extend(
+                                        filtered_response_feature_rows
+                                    )
+                                    final_accumulation_estimator_rows["targets"].extend(filtered_targets)
+
+                    num_final_prompts = (
+                        len(set(final_accumulation.non_tensor_batch["uid"])) if final_accumulation is not None else 0
+                    )
 
                     alpha = zero_adv_prompt_count / seen_prompt_count if seen_prompt_count > 0 else 0.0
                     crrl_metrics["crrl/group_filter/alpha"] = float(alpha)
