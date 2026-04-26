@@ -127,6 +127,17 @@ class DataParallelPPOActor(BasePPOActor):
         n = max(1, min(int(n), hidden_tokens.size(0)))
         return hidden_tokens[-n:].mean(dim=0).to(torch.float32)
 
+    @staticmethod
+    def _find_last_subseq(ids: list[int], subseq: list[int]) -> int | None:
+        """Return the end index (inclusive) of the last occurrence of subseq in ids, or None."""
+        n, m = len(ids), len(subseq)
+        if m == 0 or n < m:
+            return None
+        for i in range(n - m, -1, -1):
+            if ids[i : i + m] == subseq:
+                return i + m - 1
+        return None
+
     def _build_hidden_capture(
         self,
         *,
@@ -136,6 +147,8 @@ class DataParallelPPOActor(BasePPOActor):
         response_length: int,
         prompt_pool_n: int,
         response_pool_n: int,
+        response_ids: torch.Tensor | None = None,
+        think_end_token_ids: list[int] | None = None,
     ) -> dict[str, torch.Tensor]:
         batch_size, seqlen, hidden_dim = full_hidden.shape
         prompt_length = seqlen - response_length
@@ -151,12 +164,24 @@ class DataParallelPPOActor(BasePPOActor):
             prompt_tokens = prompt_tokens[prompt_valid_mask]
             prompt_hidden_rows.append(self._pool_last_n_tokens(prompt_tokens, prompt_pool_n, hidden_dim))
 
-            response_tokens = full_hidden[row_idx, prompt_length:, :]
+            response_hidden_full = full_hidden[row_idx, prompt_length:, :]
             if response_mask is not None:
                 response_valid_mask = response_mask[row_idx].bool()
             else:
                 response_valid_mask = attention_mask[row_idx, prompt_length:].bool()
-            response_tokens = response_tokens[response_valid_mask]
+
+            # If </think> token IDs are provided, pool up to (and including) </think>.
+            # Fall back to full response pooling when </think> is absent.
+            if response_ids is not None and think_end_token_ids:
+                valid_ids = response_ids[row_idx][response_valid_mask].tolist()
+                think_end_pos = self._find_last_subseq(valid_ids, think_end_token_ids)
+                if think_end_pos is not None:
+                    response_tokens = response_hidden_full[response_valid_mask][: think_end_pos + 1]
+                else:
+                    response_tokens = response_hidden_full[response_valid_mask]
+            else:
+                response_tokens = response_hidden_full[response_valid_mask]
+
             response_hidden_rows.append(self._pool_last_n_tokens(response_tokens, response_pool_n, hidden_dim))
 
         return {
@@ -370,6 +395,8 @@ class DataParallelPPOActor(BasePPOActor):
                         response_length=response_length,
                         prompt_pool_n=int(hidden_capture_spec["prompt_pool_n"]),
                         response_pool_n=int(hidden_capture_spec["response_pool_n"]),
+                        response_ids=micro_batch.get("responses"),
+                        think_end_token_ids=hidden_capture_spec.get("think_end_token_ids"),
                     )
 
                 # only return response part:
@@ -425,6 +452,8 @@ class DataParallelPPOActor(BasePPOActor):
                         response_length=response_length,
                         prompt_pool_n=int(hidden_capture_spec["prompt_pool_n"]),
                         response_pool_n=int(hidden_capture_spec["response_pool_n"]),
+                        response_ids=micro_batch.get("responses"),
+                        think_end_token_ids=hidden_capture_spec.get("think_end_token_ids"),
                     )
 
             if layer_hook_handle is not None:
@@ -484,6 +513,7 @@ class DataParallelPPOActor(BasePPOActor):
                 "layer_index": int(hidden_capture_spec["layer_index"]),
                 "prompt_pool_n": int(hidden_capture_spec["prompt_pool_n"]),
                 "response_pool_n": int(hidden_capture_spec["response_pool_n"]),
+                "think_end_token_ids": [int(x) for x in hidden_capture_spec.get("think_end_token_ids", [])],
             }
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()

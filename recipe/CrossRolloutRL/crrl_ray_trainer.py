@@ -1071,10 +1071,12 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                 if feature_builder_config.response_hidden.pooling.type != "last_n_mean":
                     raise ValueError("trainer.crrl.estimator expects response_hidden.pooling.type='last_n_mean'.")
 
+                think_end_token_ids = self.tokenizer.encode("</think>", add_special_tokens=False)
                 estimator_capture_spec = {
                     "layer_index": int(feature_builder_config.prompt_hidden.layer_index),
                     "prompt_pool_n": int(feature_builder_config.prompt_hidden.pooling.n),
                     "response_pool_n": int(feature_builder_config.response_hidden.pooling.n),
+                    "think_end_token_ids": think_end_token_ids,
                 }
                 rollout_n = int(self.config.actor_rollout_ref.rollout.n)
                 if rollout_n != estimator_pair_size:
