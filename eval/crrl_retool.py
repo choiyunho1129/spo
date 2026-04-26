@@ -158,12 +158,12 @@ class CustomRLHFDataset(RLHFDataset):
             if source_prompt is not None:
                 row["source_prompt"] = list(source_prompt)
             else:
-                row["source_prompt"] = self._build_dapo_source_prompt(row.get("prompt") or row.get("problem"))
+                row["source_prompt"] = self._build_dapo_source_prompt(row.get("prompt") or row.get("problem") or row.get("question"))
             row.pop("agent_name", None)
             return row
         print("prompt")
         exit()
-        content = row.get("prompt") or row.get("problem")
+        content = row.get("prompt") or row.get("problem") or row.get("question")
         row["prompt"] = [{"role": "user", "content": content + answer_format}]
         row["agent_name"] = "crrl_tool_agent"
         return row
