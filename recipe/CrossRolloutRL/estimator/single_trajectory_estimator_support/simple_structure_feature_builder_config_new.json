@@ -33,9 +33,6 @@
     "derived_scalar_keys": [
       "entropy_gap_reasoning_answer",
       "answer_entropy_gap_vs_output"
-    ],
-    "extra_scalar_field_paths": [ 
-      "rollout_features.answer_mean_token_entropy"
-    ] 
+    ]
   }
 }

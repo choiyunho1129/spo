@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import hashlib
+import math
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
@@ -1166,6 +1167,17 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         target_prompt_batch_size = int(self.config.data.train_batch_size)
         rollout_repeat = int(self.config.actor_rollout_ref.rollout.n)
         target_traj_batch_size = target_prompt_batch_size * rollout_repeat
+        rollout_agent_workers = (
+            int(self.config.actor_rollout_ref.rollout.agent.num_workers)
+            if self.config.actor_rollout_ref.rollout.mode == "async"
+            else 1
+        )
+        if rollout_agent_workers <= 0:
+            raise ValueError(
+                "actor_rollout_ref.rollout.agent.num_workers must be positive, "
+                f"got {rollout_agent_workers}"
+            )
+        prompt_chunk_divisor = rollout_agent_workers // math.gcd(rollout_agent_workers, rollout_repeat)
         default_br_size = int(self.config.data.get("default_br_size", 768))
         if default_br_size <= 0:
             raise ValueError(f"data.default_br_size must be a positive integer, got {default_br_size}")
@@ -1267,12 +1279,18 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     if unique_indices:
                         pre_filter_buffer = DataProto.concat([pre_filter_buffer, new_batch[unique_indices]])
 
+                effective_target_accumulation_size = (
+                    (target_accumulation_size + prompt_chunk_divisor - 1) // prompt_chunk_divisor
+                ) * prompt_chunk_divisor
                 current_prompt_pool_size = len(set(pre_filter_buffer.non_tensor_batch["uid"]))
-                if current_prompt_pool_size < target_accumulation_size:
+                if current_prompt_pool_size < effective_target_accumulation_size:
                     continue
 
-                batch = pre_filter_buffer
-                pre_filter_buffer = None
+                batch = pre_filter_buffer[:effective_target_accumulation_size]
+                remaining_pre_filter_buffer = pre_filter_buffer[effective_target_accumulation_size:]
+                pre_filter_buffer = (
+                    remaining_pre_filter_buffer if len(remaining_pre_filter_buffer) > 0 else None
+                )
                 current_round_prompt_count = len(set(batch.non_tensor_batch["uid"]))
                 group_filter_round_count += 1
                 group_filter_generated_prompts_total += current_round_prompt_count
@@ -1532,6 +1550,18 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 crrl_metrics["crrl/adaptive_estimator/pred_clip_frac_max"] = float(
                                     np.mean(pred_values_np >= (clip_max - 1e-6))
                                 )
+
+                                r_np = r.detach().cpu().numpy().astype(np.float32, copy=False)
+                                mask_at_min = pred_values_np <= (clip_min + 1e-6)
+                                mask_at_max = pred_values_np >= (clip_max - 1e-6)
+                                if mask_at_min.sum() > 0:
+                                    crrl_metrics["crrl/adaptive_estimator/pred_clip_min_reward_match_frac"] = float(
+                                        np.mean(r_np[mask_at_min] <= (clip_min + 1e-6))
+                                    )
+                                if mask_at_max.sum() > 0:
+                                    crrl_metrics["crrl/adaptive_estimator/pred_clip_max_reward_match_frac"] = float(
+                                        np.mean(r_np[mask_at_max] >= (clip_max - 1e-6))
+                                    )
 
                             else:
                                 missing_baseline_count = 0
