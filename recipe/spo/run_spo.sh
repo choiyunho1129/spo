@@ -1,9 +1,11 @@
 set -x
-export CUDA_VISIBLE_DEVICES=1,2,3,4
+export CUDA_VISIBLE_DEVICES=3
 export VLLM_USE_V1=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
 # wandb stability (override if needed)
+export WANDB_API_KEY=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
+export WANDB_ENTITY=riasok
 export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
 export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
 export WANDB_INIT_TIMEOUT=${WANDB_INIT_TIMEOUT:-300}
@@ -11,7 +13,7 @@ export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
 
 OUTPUT_DIR=${OUTPUT_DIR:-"spo_verl_pr"}
 TRAIN_DATA_DIR=${TRAIN_DATA_DIR:-"data/DAPO-Math-17k-Processed_Splits"}
-EXP_NAME=${EXP_NAME:-"Qwen3-4B_GRPO_batch_1024"}
+EXP_NAME=${EXP_NAME:-"Qwen3-4B_GRPO_batch_1024_B200"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
 N_VAL=${N_VAL:-8}
@@ -97,7 +99,7 @@ fi
 
 # ================= perfomance =================
 infer_tp=1 # vllm
-train_sp=4 # train
+train_sp=1 # train
 offload=True
 rollout_agent_workers=${ROLLOUT_AGENT_WORKERS:-4}
 rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
