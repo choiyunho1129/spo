@@ -13,9 +13,8 @@ from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils import hf_processor
 from collections import defaultdict
 from tqdm import tqdm
-from verl.utils.reward_score.math_dapo import compute_score
 
-from crrl_retool import CustomRLHFDataset
+from crrl_retool import CustomRLHFDataset, compute_score
 
 
 def timeout(timeout_seconds: int = 10):
@@ -172,12 +171,22 @@ def main(
         prompts = []
         for rp in raw_prompts:
             if isinstance(rp, list) and len(rp) > 0:
-                # [{"role": "user", "content": "..."}] 형태에서 content 추출
-                content = rp[0].get("content", "") if isinstance(rp[0], dict) else str(rp[0])
-                prompts.append(content)
+                # system message 제거
+                filtered_rp = [msg for msg in rp if msg.get("role") != "system"]
+                # print(f"Filtered: {filtered_rp}")  # ← 확인용
+
+                # chat_template 적용
+                prompt_text = tokenizer.apply_chat_template(
+                    filtered_rp,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                if '<|im_start|>system' in prompt_text:
+                    prompt_text = prompt_text.split('<|im_end|>\n', 1)[-1]
+                prompts.append(prompt_text)
             else:
                 prompts.append(str(rp))
-        
+
         # print(f"DEBUG len(prompts)={len(prompts)}")
         # if prompts:
         #     print(f"DEBUG sample prompt:\n{prompts[0][:300]}")
@@ -236,14 +245,15 @@ def main(
         
         # 5. compute_score로 채점
         for idx in range(len(response_texts)):
+            data_source = data_sources_batch[idx]  # ← 여기서 할당 (너무 늦음)
             result = compute_score(
+                data_source=data_source,
                 solution_str=response_texts[idx],
                 ground_truth=ground_truths[idx],
-                strict_box_verify=False
+                extra_info={},
             )
             correct = result["acc"]
-            data_source = data_sources_batch[idx]
-            
+
             rets[data_source].append(int(correct))
             save_data.append({
                 'prompt': prompts[idx // n] if idx // n < len(prompts) else "",
