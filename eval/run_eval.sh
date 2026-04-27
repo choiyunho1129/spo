@@ -24,6 +24,7 @@ mkdir -p $OUTPUT_DIR
 DATASETS=(
     "$ROOT/data/AIME_2024.parquet"
     "$ROOT/data/AIME_2025.parquet"
+    "$ROOT/data/AIME_2026.parquet"
     "$ROOT/data/AMC23_test.parquet"
     "$ROOT/data/AMC24_test.parquet"
     "$ROOT/data/brumo_2025.parquet"
