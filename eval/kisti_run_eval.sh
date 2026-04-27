@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=20
 #SBATCH --gres=gpu:8
-#SBATCH --time=01:30:00
+#SBATCH --time=00:30:00
 #SBATCH --exclusive
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=awj1204@snu.ac.kr
@@ -110,7 +110,7 @@ for DATA in "${DATASETS[@]}"; do
     fi
 
     # GPU 할당 및 Singularity 실행
-    CUDA_VISIBLE_DEVICES=0,1,2,3 singularity exec --nv \
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 singularity exec --nv \
     --bind $MY_DIR \
     --bind $MY_DIR/.cache/flashinfer:/home01/x3326a36/.cache/flashinfer \
     $SIF_PATH \
