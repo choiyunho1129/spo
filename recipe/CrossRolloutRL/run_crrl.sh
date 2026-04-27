@@ -1,5 +1,5 @@
 set -x
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=1,2,3,4
 export VLLM_USE_V1=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
@@ -16,7 +16,7 @@ export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_DIR}/wandb"}
 #base config
 OUTPUT_DIR=${OUTPUT_DIR:-"crrl_verl_pr"}
 TRAIN_DATA_DIR=${TRAIN_DATA_DIR:-"data/DAPO-Math-17k-Processed_Splits"}
-EXP_NAME=${EXP_NAME:-"Qwen3-4B_CRRL_batch_512_B200_dynamic_sampling"}
+EXP_NAME=${EXP_NAME:-"Qwen3-4B_CRRL_batch_1024_dynamic_sampling"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-4B"}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
 N_VAL=${N_VAL:-8}
@@ -29,7 +29,7 @@ ESTIMATOR_MODEL_PATH=${ESTIMATOR_MODEL_PATH:-"recipe/CrossRolloutRL/estimator/ar
 ESTIMATOR_FEATURE_BUILDER_CONFIG=${ESTIMATOR_FEATURE_BUILDER_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/simple_structure_feature_builder_config.json"}
 ESTIMATOR_FIT_CONFIG=${ESTIMATOR_FIT_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/simple_structure_estimator_fit_config.json"}
 ESTIMATOR_PAIR_SIZE=${ESTIMATOR_PAIR_SIZE:-2}
-ESTIMATOR_WARMUP_STEPS=${ESTIMATOR_WARMUP_STEPS:-8}
+ESTIMATOR_WARMUP_STEPS=${ESTIMATOR_WARMUP_STEPS:-4}
 CRRL_MISSING_PROMPT=${CRRL_MISSING_PROMPT:-"default"} # error | default
 CRRL_DEFAULT_P_HAT=${CRRL_DEFAULT_P_HAT:-0.5}
 CRRL_WEIGHTED_SAMPLING=${CRRL_WEIGHTED_SAMPLING:-"False"}
@@ -75,11 +75,11 @@ reward_manager=naive
 
 n_resp_per_prompt=2
 n_resp_per_prompt_val=$N_VAL
-train_batch_size=256
+train_batch_size=512
 ppo_mini_batch_size=128
 val_batch_size=128
 gen_batch_size=8 
-CRRL_DEFAULT_BR_SIZE=${CRRL_DEFAULT_BR_SIZE:-384}
+CRRL_DEFAULT_BR_SIZE=${CRRL_DEFAULT_BR_SIZE:-614}
 CRRL_BETA=${CRRL_BETA:-1.25}
 CRRL_ADVANTAGE_ZERO_EPS=${CRRL_ADVANTAGE_ZERO_EPS:-1e-8}
 crrl_enable=True
@@ -106,7 +106,7 @@ fi
 
 # ================= gpu, vllm config =================
 infer_tp=1 # vllm
-train_sp=1 # train
+train_sp=4 # train
 offload=True
 rollout_agent_workers=${ROLLOUT_AGENT_WORKERS:-4}
 rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64} 
