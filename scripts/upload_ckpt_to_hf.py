@@ -21,13 +21,22 @@ import sys
 from pathlib import Path
 
 
+DEFAULT_HF_HOME = Path(__file__).resolve().parents[2] / ".hf"
+os.environ.setdefault("HF_HOME", str(DEFAULT_HF_HOME))
+Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
+try:
+    Path(os.environ["HF_HOME"]).chmod(0o700)
+except OSError:
+    pass
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt_dir", type=str, default="/data1/home/yunhochoi/verl/checkpoints/ValueEstimator/Qwen3-4B_DAPO_batch_1024_temp_1.0",
+    parser.add_argument("--ckpt_dir", type=str, default="/NHNHOME/WORKSPACE/26msit006_A/kisti/snu/yunhochoi/crrl/crrl_verl_pr/Qwen3-4B_CRRL_batch_1024_B200/checkpoints",
                         help="Root checkpoint directory (contains global_step_* folders)")
-    parser.add_argument("--step", type=int, default=90,
+    parser.add_argument("--step", type=int, default=50,
                         help="Step number to upload (e.g. 100)")
-    parser.add_argument("--repo_id", type=str, default="yunhowhour/DAPO_batch_1024_step_90",
+    parser.add_argument("--repo_id", type=str, default="yunhowhour/CRRL_batch_1024_step_50",
                         help="HuggingFace repo id, e.g. username/model-name")
     parser.add_argument("--hf_token", type=str, default=None,
                         help="HuggingFace token (falls back to HF_TOKEN env var)")
