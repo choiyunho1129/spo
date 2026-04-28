@@ -17,11 +17,17 @@ trainer:
     missing_prompt: "error"  # error | default
     default_p_hat: 0.5
     weighted_sampling: True
+    group_filter:
+      enable: True
+    # null/auto -> ${trainer.default_local_dir}/prompt_reward_logs
+    prompt_reward_log_dir: null
     estimator:
       model_path: null
       feature_builder_config_path: "recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_feature_builder_config.json"
       pair_size: 2
       fit_config_path: "recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/default_estimator_fit_config.json"
       warmup_steps: 4
+      buffer_max_steps: 4
+      # null/auto -> ${trainer.default_local_dir}/adaptive_estimator_updates
       online_output_dir: null
       log_rows_on_retrain: true

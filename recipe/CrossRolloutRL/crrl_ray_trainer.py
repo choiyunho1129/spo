@@ -84,6 +84,11 @@ class RayPPOTrainer(BaseRayPPOTrainer):
     _ESTIMATOR_RESUME_STATE_FILENAME = "crrl_adaptive_estimator_resume_state.pt"
     _ESTIMATOR_RESUME_META_FILENAME = "crrl_adaptive_estimator_resume_state.meta.json"
     _ESTIMATOR_SNAPSHOT_FILENAME = "crrl_adaptive_estimator_current.joblib"
+    _ESTIMATOR_UPDATE_ROOT_DIRNAME = "adaptive_estimator_updates"
+    _ESTIMATOR_UPDATE_META_FILENAME = "crrl_adaptive_estimator_update.meta.json"
+    _ESTIMATOR_LATEST_UPDATE_FILENAME = "latest_adaptive_estimator_update.txt"
+    _PROMPT_REWARD_LOG_ROOT_DIRNAME = "prompt_reward_logs"
+    _PROMPT_REWARD_LATEST_FILENAME = "latest_prompt_reward_log.txt"
 
     def _default_local_ckpt_root(self) -> str:
         checkpoint_folder = str(self.config.trainer.default_local_dir)
@@ -93,6 +98,65 @@ class RayPPOTrainer(BaseRayPPOTrainer):
 
     def _current_global_step_ckpt_dir(self) -> str:
         return os.path.join(self._default_local_ckpt_root(), f"global_step_{self.global_steps}")
+
+    def _default_estimator_update_root(self) -> str:
+        return os.path.join(self._default_local_ckpt_root(), self._ESTIMATOR_UPDATE_ROOT_DIRNAME)
+
+    def _default_prompt_reward_log_root(self) -> str:
+        return os.path.join(self._default_local_ckpt_root(), self._PROMPT_REWARD_LOG_ROOT_DIRNAME)
+
+    def _resolve_estimator_update_output_dir(self, output_dir: str | None) -> str:
+        if output_dir is not None:
+            path = str(output_dir).strip()
+            if path and path.lower() not in {"none", "null", "auto"}:
+                path = os.path.expanduser(path)
+                if not os.path.isabs(path):
+                    path = os.path.join(os.getcwd(), path)
+                return path
+        return self._default_estimator_update_root()
+
+    def _resolve_prompt_reward_log_dir(self, output_dir: str | None) -> str:
+        if output_dir is not None:
+            path = str(output_dir).strip()
+            if path and path.lower() not in {"none", "null", "auto"}:
+                path = os.path.expanduser(path)
+                if not os.path.isabs(path):
+                    path = os.path.join(os.getcwd(), path)
+                return path
+        return self._default_prompt_reward_log_root()
+
+    @staticmethod
+    def _config_bool(value, *, name: str) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "off"}:
+                return False
+            raise ValueError(f"{name} must be a boolean value, got: {value!r}")
+        return bool(value)
+
+    @staticmethod
+    def _new_estimator_row_buffer() -> dict[str, list]:
+        return {
+            "prompt_hidden_rows": [],
+            "response_hidden_rows": [],
+            "response_feature_rows": [],
+            "targets": [],
+        }
+
+    @staticmethod
+    def _extend_estimator_row_buffer(dst: dict[str, list], src: dict[str, list]) -> None:
+        for key in ("prompt_hidden_rows", "response_hidden_rows", "response_feature_rows", "targets"):
+            dst[key].extend(src[key])
+
+    @staticmethod
+    def _normalize_step_row_counts(values: list | np.ndarray | None) -> list[int]:
+        if values is None:
+            return []
+        return [int(v) for v in values if int(v) > 0]
 
     @staticmethod
     def _normalize_hidden_rows(rows: list | None) -> list[np.ndarray]:
@@ -276,6 +340,7 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         train_response_hidden_rows: list[np.ndarray],
         train_response_feature_rows: list[dict[str, float]],
         train_targets: list[float],
+        train_step_row_counts: list[int],
     ) -> None:
         self._adaptive_estimator_checkpoint_state = {
             "enabled": True,
@@ -286,12 +351,44 @@ class RayPPOTrainer(BaseRayPPOTrainer):
             "train_response_hidden_rows": self._normalize_hidden_rows(train_response_hidden_rows),
             "train_response_feature_rows": self._normalize_feature_rows(train_response_feature_rows),
             "train_targets": self._normalize_targets(train_targets),
+            "train_step_row_counts": self._normalize_step_row_counts(train_step_row_counts),
         }
         self._adaptive_estimator_checkpoint_bundle = estimator_bundle
 
     def _clear_adaptive_estimator_checkpoint_state(self) -> None:
         self._adaptive_estimator_checkpoint_state = None
         self._adaptive_estimator_checkpoint_bundle = None
+
+    @staticmethod
+    def _save_estimator_bundle_or_copy(
+        *,
+        estimator_bundle: dict | None,
+        estimator_model_path: str | None,
+        snapshot_path: str,
+    ) -> tuple[str | None, bool]:
+        resolved_model_path = None
+        if estimator_model_path:
+            resolved_model_path = os.path.abspath(os.path.expanduser(str(estimator_model_path)))
+
+        os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
+        if estimator_bundle is not None:
+            try:
+                import joblib
+            except ImportError as exc:
+                raise ImportError("joblib is required to save adaptive estimator snapshots.") from exc
+            joblib.dump(estimator_bundle, snapshot_path)
+        elif resolved_model_path:
+            if os.path.exists(resolved_model_path):
+                shutil.copy2(resolved_model_path, snapshot_path)
+            else:
+                print(
+                    "[WARN] Adaptive estimator model snapshot source is missing; "
+                    f"keep original path only: {resolved_model_path}"
+                )
+
+        if os.path.exists(snapshot_path):
+            return snapshot_path, True
+        return resolved_model_path, False
 
     def _save_adaptive_estimator_checkpoint_state(self, checkpoint_dir: str) -> None:
         state = getattr(self, "_adaptive_estimator_checkpoint_state", None)
@@ -302,32 +399,13 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         saved_state = dict(state)
         estimator_bundle = getattr(self, "_adaptive_estimator_checkpoint_bundle", None)
 
-        estimator_model_path = saved_state.get("estimator_model_path")
-        resolved_model_path = None
-        if estimator_model_path:
-            resolved_model_path = os.path.abspath(os.path.expanduser(str(estimator_model_path)))
         snapshot_path = os.path.join(checkpoint_dir, self._ESTIMATOR_SNAPSHOT_FILENAME)
-        if estimator_bundle is not None:
-            try:
-                import joblib
-            except ImportError as exc:
-                raise ImportError(
-                    "joblib is required to save adaptive estimator checkpoint snapshots."
-                ) from exc
-            joblib.dump(estimator_bundle, snapshot_path)
-        elif estimator_model_path:
-            if os.path.exists(resolved_model_path):
-                shutil.copy2(resolved_model_path, snapshot_path)
-            else:
-                print(
-                    "[WARN] Adaptive estimator model snapshot source is missing; "
-                    f"keep original path only: {resolved_model_path}"
-                )
-
-        if os.path.exists(snapshot_path):
-            saved_state["estimator_model_path"] = snapshot_path
-        else:
-            saved_state["estimator_model_path"] = resolved_model_path
+        saved_model_path, _ = self._save_estimator_bundle_or_copy(
+            estimator_bundle=estimator_bundle,
+            estimator_model_path=saved_state.get("estimator_model_path"),
+            snapshot_path=snapshot_path,
+        )
+        saved_state["estimator_model_path"] = saved_model_path
 
         state_path = os.path.join(checkpoint_dir, self._ESTIMATOR_RESUME_STATE_FILENAME)
         torch.save(saved_state, state_path)
@@ -338,10 +416,53 @@ class RayPPOTrainer(BaseRayPPOTrainer):
             "retrain_steps": int(saved_state.get("retrain_steps", 0)),
             "retrain_count": int(saved_state.get("retrain_count", 0)),
             "buffer_rows": int(len(saved_state.get("train_targets", []))),
+            "buffer_steps": int(len(saved_state.get("train_step_row_counts", []))),
+            "buffer_step_row_counts": [int(v) for v in saved_state.get("train_step_row_counts", [])],
             "estimator_model_path": saved_state.get("estimator_model_path"),
         }
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_payload, f, ensure_ascii=False, indent=2)
+
+    def _save_adaptive_estimator_update_snapshot(
+        self,
+        *,
+        output_dir: str,
+        estimator_model_path: str | None,
+        estimator_bundle: dict | None,
+        retrain_steps: int,
+        retrain_count: int,
+        train_targets: list[float],
+        train_step_row_counts: list[int],
+    ) -> str | None:
+        update_dir = os.path.join(output_dir, f"global_step_{self.global_steps}")
+        snapshot_path = os.path.join(update_dir, self._ESTIMATOR_SNAPSHOT_FILENAME)
+        saved_model_path, snapshot_saved = self._save_estimator_bundle_or_copy(
+            estimator_bundle=estimator_bundle,
+            estimator_model_path=estimator_model_path,
+            snapshot_path=snapshot_path,
+        )
+
+        meta_payload = {
+            "schema_version": 1,
+            "global_step": int(self.global_steps),
+            "retrain_steps": int(retrain_steps),
+            "retrain_count": int(retrain_count),
+            "buffer_rows": int(len(train_targets)),
+            "buffer_steps": int(len(train_step_row_counts)),
+            "buffer_step_row_counts": [int(v) for v in train_step_row_counts],
+            "estimator_model_path": saved_model_path,
+            "snapshot_saved": bool(snapshot_saved),
+        }
+        meta_path = os.path.join(update_dir, self._ESTIMATOR_UPDATE_META_FILENAME)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta_payload, f, ensure_ascii=False, indent=2)
+
+        os.makedirs(output_dir, exist_ok=True)
+        latest_path = os.path.join(output_dir, self._ESTIMATOR_LATEST_UPDATE_FILENAME)
+        with open(latest_path, "w", encoding="utf-8") as f:
+            f.write(str(self.global_steps))
+
+        return saved_model_path if snapshot_saved else None
 
     def _resolve_loaded_checkpoint_dir(self) -> str | None:
         if self.global_steps <= 0:
@@ -417,6 +538,111 @@ class RayPPOTrainer(BaseRayPPOTrainer):
             f.write("\n".join(lines) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    def _decode_model_prompts(self, batch: DataProto) -> list[str]:
+        if "prompts" not in batch.batch.keys():
+            raw_prompts = batch.non_tensor_batch.get("raw_prompt", None)
+            if raw_prompts is None:
+                return [""] * len(batch.batch)
+            return [self._extract_prompt_text(raw_prompt) for raw_prompt in raw_prompts]
+
+        prompt_ids = batch.batch["prompts"]
+        prompt_attention_mask = None
+        if "attention_mask" in batch.batch.keys():
+            attention_mask = batch.batch["attention_mask"]
+            if attention_mask.ndim == 2 and attention_mask.shape[0] == prompt_ids.shape[0]:
+                prompt_attention_mask = attention_mask[:, : prompt_ids.shape[1]].bool()
+
+        decoded_prompts = []
+        pad_token_id = self.tokenizer.pad_token_id
+        for row_idx in range(prompt_ids.shape[0]):
+            row = prompt_ids[row_idx].detach().cpu()
+            if prompt_attention_mask is not None:
+                row = row[prompt_attention_mask[row_idx].detach().cpu()]
+            elif pad_token_id is not None:
+                row = row[row != pad_token_id]
+            decoded_prompts.append(self.tokenizer.decode(row.tolist(), skip_special_tokens=False).strip())
+        return decoded_prompts
+
+    def _accumulate_prompt_reward_log_rows(
+        self,
+        *,
+        accumulator: dict[str, dict],
+        order: list[str],
+        batch: DataProto,
+        reward_sums: torch.Tensor,
+        round_index: int,
+    ) -> None:
+        model_prompts = self._decode_model_prompts(batch)
+        raw_prompts = batch.non_tensor_batch.get("raw_prompt", None)
+        uids = batch.non_tensor_batch.get("uid", None)
+        rewards = reward_sums.detach().to(torch.float32).cpu().tolist()
+
+        for row_idx, reward in enumerate(rewards):
+            uid = str(uids[row_idx]) if uids is not None else str(row_idx)
+            if uid not in accumulator:
+                order.append(uid)
+                accumulator[uid] = {
+                    "uid": uid,
+                    "prompt": model_prompts[row_idx],
+                    "raw_prompt": self._extract_prompt_text(raw_prompts[row_idx]) if raw_prompts is not None else "",
+                    "rollout_rewards": [],
+                    "round_indices": [],
+                }
+            accumulator[uid]["rollout_rewards"].append(float(reward))
+            accumulator[uid]["round_indices"].append(int(round_index))
+
+    def _dump_prompt_reward_log(
+        self,
+        *,
+        output_dir: str,
+        accumulator: dict[str, dict],
+        order: list[str],
+        group_filter_enabled: bool,
+        rollout_repeat: int,
+        rounds_total: int,
+        final_train_batch_rows: int,
+    ) -> str:
+        os.makedirs(output_dir, exist_ok=True)
+        records = []
+        for prompt_index, uid in enumerate(order):
+            row = accumulator[uid]
+            rewards = [float(v) for v in row["rollout_rewards"]]
+            reward_mean = float(np.mean(rewards)) if rewards else 0.0
+            records.append(
+                {
+                    "prompt_index": int(prompt_index),
+                    "uid": row["uid"],
+                    "prompt": row["prompt"],
+                    "raw_prompt": row["raw_prompt"],
+                    "reward_mean": reward_mean,
+                    "num_rollouts": int(len(rewards)),
+                    "rollout_rewards": rewards,
+                    "round_indices": sorted(set(int(v) for v in row["round_indices"])),
+                }
+            )
+
+        payload = {
+            "schema_version": 1,
+            "global_step": int(self.global_steps),
+            "group_filter_enabled": bool(group_filter_enabled),
+            "rollout_repeat": int(rollout_repeat),
+            "rounds_total": int(rounds_total),
+            "final_train_batch_rows": int(final_train_batch_rows),
+            "prompt_count": int(len(records)),
+            "trajectory_count": int(sum(record["num_rollouts"] for record in records)),
+            "records": records,
+        }
+
+        filename = os.path.join(output_dir, f"{self.global_steps}.json")
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=self._json_default)
+
+        latest_path = os.path.join(output_dir, self._PROMPT_REWARD_LATEST_FILENAME)
+        with open(latest_path, "w", encoding="utf-8") as f:
+            f.write(str(self.global_steps))
+
+        return filename
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         """Override: Get generation batch with CRRL-specific keys.
@@ -873,23 +1099,33 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         estimator_enabled = False
         estimator = None
         estimator_feature_builder = None
+        prompt_reward_log_dir = None
         estimator_feature_builder_config = None
         estimator_fit_config = None
         estimator_fit_single_fn = None
         estimator_current_model_path = None
         estimator_current_bundle = None
+        estimator_update_output_dir = None
         estimator_pair_size = 2
         estimator_capture_spec = None
         estimator_warmup_steps = 4
         estimator_retrain_steps = 0
         estimator_retrain_count = 0
-        estimator_buffer_max_rows = 4096
+        estimator_buffer_max_steps = 4
         estimator_train_prompt_hidden_rows: list[np.ndarray] = []
         estimator_train_response_hidden_rows: list[np.ndarray] = []
         estimator_train_response_feature_rows: list[dict[str, float]] = []
         estimator_train_targets: list[float] = []
+        estimator_train_step_row_counts: list[int] = []
+        crrl_group_filter_cfg = self.config.trainer.crrl.get("group_filter", {})
+        crrl_group_filter_enabled = self._config_bool(
+            crrl_group_filter_cfg.get("enable", True), name="trainer.crrl.group_filter.enable"
+        )
 
         if self.config.trainer.crrl.enable:
+            prompt_reward_log_dir = self._resolve_prompt_reward_log_dir(
+                self.config.trainer.crrl.get("prompt_reward_log_dir", None)
+            )
             crrl_mode = str(self.config.trainer.crrl.get("mode", "non_adaptive_estimator")).lower()
             if crrl_mode not in {"non_adaptive_estimator", "adaptive_estimator"}:
                 raise ValueError(
@@ -907,7 +1143,9 @@ class RayPPOTrainer(BaseRayPPOTrainer):
             if not (0.0 <= crrl_default_p_hat <= 1.0):
                 raise ValueError(f"trainer.crrl.default_p_hat must be in [0, 1], got: {crrl_default_p_hat}")
 
-            crrl_weighted_sampling = bool(self.config.trainer.crrl.get("weighted_sampling", True))
+            crrl_weighted_sampling = self._config_bool(
+                self.config.trainer.crrl.get("weighted_sampling", True), name="trainer.crrl.weighted_sampling"
+            )
             estimator_enabled = crrl_mode == "adaptive_estimator"
 
             if crrl_mode == "non_adaptive_estimator":
@@ -1034,11 +1272,11 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         "trainer.crrl.estimator.warmup_steps must be a positive integer, "
                         f"got {estimator_warmup_steps}."
                     )
-                estimator_buffer_max_rows = int(crrl_estimator_cfg.get("buffer_max_rows", 4096))
-                if estimator_buffer_max_rows <= 0:
+                estimator_buffer_max_steps = int(crrl_estimator_cfg.get("buffer_max_steps", 4))
+                if estimator_buffer_max_steps <= 0:
                     raise ValueError(
-                        "trainer.crrl.estimator.buffer_max_rows must be a positive integer, "
-                        f"got {estimator_buffer_max_rows}."
+                        "trainer.crrl.estimator.buffer_max_steps must be a positive integer, "
+                        f"got {estimator_buffer_max_steps}."
                     )
 
                 fit_config_path = crrl_estimator_cfg.get(
@@ -1056,11 +1294,9 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     )
                 estimator_fit_single_fn = fit_single_trajectory_estimator
 
-                if crrl_estimator_cfg.get("online_output_dir", None):
-                    print(
-                        "[WARN] trainer.crrl.estimator.online_output_dir is ignored. "
-                        "Adaptive estimator artifacts are now checkpoint-only."
-                    )
+                estimator_update_output_dir = self._resolve_estimator_update_output_dir(
+                    crrl_estimator_cfg.get("online_output_dir", None)
+                )
 
                 if feature_builder_config.prompt_hidden.layer_index != feature_builder_config.response_hidden.layer_index:
                     raise ValueError(
@@ -1090,9 +1326,10 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     "[DEBUG] Enabled CRRL estimator baseline: "
                     f"model={estimator_model_path}, pair_size={estimator_pair_size}, "
                     f"hidden_source=pi_theta, warmup_steps={estimator_warmup_steps}, "
-                    f"fifo_max_rows={estimator_buffer_max_rows}, "
+                    f"fifo_max_steps={estimator_buffer_max_steps}, "
                     "update_every=1step_after_warmup, "
-                    "persistence=checkpoint_only"
+                    f"update_snapshot_dir={estimator_update_output_dir}, "
+                    "persistence=checkpoint_and_update_snapshots"
                 )
 
                 loaded_estimator_state = self._pop_loaded_adaptive_estimator_checkpoint_state()
@@ -1124,6 +1361,9 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         loaded_estimator_state.get("train_response_feature_rows")
                     )
                     estimator_train_targets = self._normalize_targets(loaded_estimator_state.get("train_targets"))
+                    estimator_train_step_row_counts = self._normalize_step_row_counts(
+                        loaded_estimator_state.get("train_step_row_counts")
+                    )
 
                     prompt_rows_len = len(estimator_train_prompt_hidden_rows)
                     response_rows_len = len(estimator_train_response_hidden_rows)
@@ -1135,20 +1375,37 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                             f"prompt={prompt_rows_len}, response={response_rows_len}, "
                             f"feature={feature_rows_len}, targets={target_rows_len}"
                         )
-                    if target_rows_len > estimator_buffer_max_rows:
-                        start_idx = target_rows_len - estimator_buffer_max_rows
-                        estimator_train_prompt_hidden_rows = estimator_train_prompt_hidden_rows[start_idx:]
-                        estimator_train_response_hidden_rows = estimator_train_response_hidden_rows[start_idx:]
-                        estimator_train_response_feature_rows = estimator_train_response_feature_rows[start_idx:]
-                        estimator_train_targets = estimator_train_targets[start_idx:]
+                    if not estimator_train_step_row_counts and target_rows_len > 0:
+                        estimator_train_step_row_counts = [target_rows_len]
+                    if sum(estimator_train_step_row_counts) != target_rows_len:
+                        print(
+                            "[WARN] Adaptive estimator resume step row counts do not match row buffer size. "
+                            "Treating restored rows as one legacy step."
+                        )
+                        estimator_train_step_row_counts = [target_rows_len] if target_rows_len > 0 else []
+                    restored_trimmed_steps = 0
+                    restored_trimmed_rows = 0
+                    while len(estimator_train_step_row_counts) > estimator_buffer_max_steps:
+                        rows_to_trim = estimator_train_step_row_counts.pop(0)
+                        restored_trimmed_rows += rows_to_trim
+                        restored_trimmed_steps += 1
+                        estimator_train_prompt_hidden_rows = estimator_train_prompt_hidden_rows[rows_to_trim:]
+                        estimator_train_response_hidden_rows = estimator_train_response_hidden_rows[rows_to_trim:]
+                        estimator_train_response_feature_rows = estimator_train_response_feature_rows[rows_to_trim:]
+                        estimator_train_targets = estimator_train_targets[rows_to_trim:]
                         target_rows_len = len(estimator_train_targets)
+                    if restored_trimmed_steps > 0:
                         print(
                             "[DEBUG] Trimmed restored adaptive estimator FIFO buffer to "
-                            f"{target_rows_len} rows (max={estimator_buffer_max_rows})."
+                            f"{len(estimator_train_step_row_counts)} steps / {target_rows_len} rows "
+                            f"(max_steps={estimator_buffer_max_steps}, "
+                            f"trimmed_steps={restored_trimmed_steps}, "
+                            f"trimmed_rows={restored_trimmed_rows})."
                         )
                     print(
                         "[DEBUG] Restored adaptive estimator state from checkpoint: "
                         f"retrain_steps={estimator_retrain_steps}, retrain_count={estimator_retrain_count}, "
+                        f"buffer_steps={len(estimator_train_step_row_counts)}, "
                         f"buffer_rows={target_rows_len}, model={estimator_current_model_path}"
                     )
             if not estimator_enabled:
@@ -1168,7 +1425,6 @@ class RayPPOTrainer(BaseRayPPOTrainer):
 
         target_prompt_batch_size = int(self.config.data.train_batch_size)
         rollout_repeat = int(self.config.actor_rollout_ref.rollout.n)
-        target_traj_batch_size = target_prompt_batch_size * rollout_repeat
         rollout_agent_workers = (
             int(self.config.actor_rollout_ref.rollout.agent.num_workers)
             if self.config.actor_rollout_ref.rollout.mode == "async"
@@ -1193,7 +1449,17 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         pre_filter_buffer = None
         final_accumulation = None
         final_accumulation_estimator_rows = None
-        target_accumulation_size = default_br_size
+        estimator_fit_accumulation_rows = self._new_estimator_row_buffer()
+        estimator_online_value_predictions: list[float] = []
+        estimator_online_targets: list[float] = []
+        estimator_online_raw_advantages: list[float] = []
+        estimator_online_rewards: list[float] = []
+        estimator_online_pairwise_sign_matches: list[float] = []
+        estimator_online_clip_min_count = 0
+        estimator_online_clip_max_count = 0
+        estimator_online_clip_min_reward_match_count = 0
+        estimator_online_clip_max_reward_match_count = 0
+        target_accumulation_size = default_br_size if crrl_group_filter_enabled else target_prompt_batch_size
         seen_prompt_count = 0
         zero_adv_prompt_count = 0
         group_filter_round_count = 0
@@ -1203,6 +1469,10 @@ class RayPPOTrainer(BaseRayPPOTrainer):
         group_filter_reward_count = 0
         group_filter_p_hat_sum = 0.0
         group_filter_p_hat_count = 0
+        prompt_reward_log_accumulator: dict[str, dict] = {}
+        prompt_reward_log_order: list[str] = []
+        # Group filtering can span multiple rollout rounds before one logged update.
+        timing_raw = defaultdict(float)
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1273,18 +1543,28 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                 if pre_filter_buffer is None:
                     pre_filter_buffer = new_batch
                 else:
-                    existing_uids = set(pre_filter_buffer.non_tensor_batch["uid"])
-                    unique_indices = [
-                        i for i, uid in enumerate(new_batch.non_tensor_batch["uid"])
-                        if uid not in existing_uids
-                    ]
-                    if unique_indices:
-                        pre_filter_buffer = DataProto.concat([pre_filter_buffer, new_batch[unique_indices]])
+                    if crrl_group_filter_enabled:
+                        existing_uids = set(pre_filter_buffer.non_tensor_batch["uid"])
+                        unique_indices = [
+                            i for i, uid in enumerate(new_batch.non_tensor_batch["uid"])
+                            if uid not in existing_uids
+                        ]
+                        if unique_indices:
+                            pre_filter_buffer = DataProto.concat([pre_filter_buffer, new_batch[unique_indices]])
+                    else:
+                        pre_filter_buffer = DataProto.concat([pre_filter_buffer, new_batch])
 
-                effective_target_accumulation_size = (
-                    (target_accumulation_size + prompt_chunk_divisor - 1) // prompt_chunk_divisor
-                ) * prompt_chunk_divisor
-                current_prompt_pool_size = len(set(pre_filter_buffer.non_tensor_batch["uid"]))
+                if crrl_group_filter_enabled:
+                    effective_target_accumulation_size = (
+                        (target_accumulation_size + prompt_chunk_divisor - 1) // prompt_chunk_divisor
+                    ) * prompt_chunk_divisor
+                else:
+                    effective_target_accumulation_size = target_prompt_batch_size
+                current_prompt_pool_size = (
+                    len(set(pre_filter_buffer.non_tensor_batch["uid"]))
+                    if crrl_group_filter_enabled
+                    else len(pre_filter_buffer.batch)
+                )
                 if current_prompt_pool_size < effective_target_accumulation_size:
                     continue
 
@@ -1299,7 +1579,6 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                 group_filter_round_generated_prompt_counts.append(current_round_prompt_count)
 
                 metrics = {}
-                timing_raw = {}
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1325,7 +1604,8 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
+                        for timing_name, timing_value in gen_batch_output.meta_info["timing"].items():
+                            timing_raw[timing_name] += timing_value
                         gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
@@ -1462,6 +1742,13 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                             r = reward_tensor.sum(dim=-1)
                             group_filter_reward_sum += float(r.to(torch.float32).sum().detach().cpu().item())
                             group_filter_reward_count += int(r.numel())
+                            self._accumulate_prompt_reward_log_rows(
+                                accumulator=prompt_reward_log_accumulator,
+                                order=prompt_reward_log_order,
+                                batch=batch,
+                                reward_sums=r,
+                                round_index=group_filter_round_count,
+                            )
 
                             if estimator_enabled:
                                 raw_advantages, p_hats, value_predictions, estimator_training_rows = (
@@ -1482,9 +1769,31 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                     dtype=torch.float32,
                                     device=value_predictions.device,
                                 )
+                                self._extend_estimator_row_buffer(
+                                    estimator_fit_accumulation_rows, estimator_training_rows
+                                )
 
+                                # Fit the estimator on every rollout generated for this actor update,
+                                # including rollouts later removed by group filtering.
                                 pred_values = value_predictions.to(torch.float32)
                                 target_errors = pred_values - estimator_targets
+                                estimator_online_value_predictions.extend(
+                                    pred_values.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                                )
+                                estimator_online_targets.extend(
+                                    estimator_targets.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                                )
+                                estimator_online_raw_advantages.extend(
+                                    raw_advantages.to(torch.float32)
+                                    .detach()
+                                    .cpu()
+                                    .numpy()
+                                    .astype(np.float32, copy=False)
+                                    .tolist()
+                                )
+                                estimator_online_rewards.extend(
+                                    r.to(torch.float32).detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                                )
                                 crrl_metrics["crrl/adaptive_estimator/online_target_mae"] = float(
                                     target_errors.abs().mean().detach().cpu().item()
                                 )
@@ -1502,7 +1811,9 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 pred_std = float(pred_values_np.std())
                                 target_std = float(estimator_targets_np.std())
                                 if pred_values_np.size > 1 and pred_std > 1e-8 and target_std > 1e-8:
-                                    online_target_pearson = float(np.corrcoef(pred_values_np, estimator_targets_np)[0, 1])
+                                    online_target_pearson = float(
+                                        np.corrcoef(pred_values_np, estimator_targets_np)[0, 1]
+                                    )
                                 else:
                                     online_target_pearson = 0.0
                                 if not np.isfinite(online_target_pearson):
@@ -1528,6 +1839,7 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                     reward_sign = np.sign(reward_diff)
                                     pairwise_sign_matches.append(1.0 if pred_sign == reward_sign else 0.0)
                                 if pairwise_sign_matches:
+                                    estimator_online_pairwise_sign_matches.extend(pairwise_sign_matches)
                                     crrl_metrics["crrl/adaptive_estimator/pairwise_sign_acc"] = float(
                                         np.mean(pairwise_sign_matches)
                                     )
@@ -1539,7 +1851,9 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                     raw_advantages.to(torch.float32).var(unbiased=False).detach().cpu().item()
                                 )
                                 if reward_var > 1e-12:
-                                    crrl_metrics["crrl/adaptive_estimator/adv_var_reduction_ratio"] = adv_var / reward_var
+                                    crrl_metrics["crrl/adaptive_estimator/adv_var_reduction_ratio"] = (
+                                        adv_var / reward_var
+                                    )
                                 else:
                                     crrl_metrics["crrl/adaptive_estimator/adv_var_reduction_ratio"] = 0.0
 
@@ -1556,11 +1870,19 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 r_np = r.detach().cpu().numpy().astype(np.float32, copy=False)
                                 mask_at_min = pred_values_np <= (clip_min + 1e-6)
                                 mask_at_max = pred_values_np >= (clip_max - 1e-6)
+                                estimator_online_clip_min_count += int(mask_at_min.sum())
+                                estimator_online_clip_max_count += int(mask_at_max.sum())
                                 if mask_at_min.sum() > 0:
+                                    estimator_online_clip_min_reward_match_count += int(
+                                        np.sum(r_np[mask_at_min] <= (clip_min + 1e-6))
+                                    )
                                     crrl_metrics["crrl/adaptive_estimator/pred_clip_min_reward_match_frac"] = float(
                                         np.mean(r_np[mask_at_min] <= (clip_min + 1e-6))
                                     )
                                 if mask_at_max.sum() > 0:
+                                    estimator_online_clip_max_reward_match_count += int(
+                                        np.sum(r_np[mask_at_max] >= (clip_max - 1e-6))
+                                    )
                                     crrl_metrics["crrl/adaptive_estimator/pred_clip_max_reward_match_frac"] = float(
                                         np.mean(r_np[mask_at_max] >= (clip_max - 1e-6))
                                     )
@@ -1624,134 +1946,203 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 config=self.config.algorithm,
                             )
 
-                    kept_traj_indices, seen_prompts_in_pool, kept_prompts_in_pool = self._get_nonzero_advantage_indices(
-                        batch, zero_eps=advantage_zero_eps, raw_advantages=raw_advantages_for_filter
-                    )
-                    zero_prompts_in_pool = seen_prompts_in_pool - kept_prompts_in_pool
-                    seen_prompt_count += seen_prompts_in_pool
-                    zero_adv_prompt_count += zero_prompts_in_pool
+                    if self.config.trainer.crrl.enable:
+                        crrl_metrics["crrl/group_filter/enabled"] = float(crrl_group_filter_enabled)
 
-                    if kept_traj_indices:
-                        filtered_batch = batch[kept_traj_indices]
+                    final_prompt_hidden_rows = None
+                    final_response_hidden_rows = None
+                    final_response_feature_rows = None
+                    final_targets = None
 
+                    if crrl_group_filter_enabled:
+                        kept_traj_indices, seen_prompts_in_pool, kept_prompts_in_pool = (
+                            self._get_nonzero_advantage_indices(
+                                batch, zero_eps=advantage_zero_eps, raw_advantages=raw_advantages_for_filter
+                            )
+                        )
+                        zero_prompts_in_pool = seen_prompts_in_pool - kept_prompts_in_pool
+                        seen_prompt_count += seen_prompts_in_pool
+                        zero_adv_prompt_count += zero_prompts_in_pool
+
+                        if kept_traj_indices:
+                            filtered_batch = batch[kept_traj_indices]
+
+                            if estimator_enabled:
+                                if estimator_training_rows is None:
+                                    raise RuntimeError(
+                                        "Estimator is enabled but estimator_training_rows is missing before filtering."
+                                    )
+                                filtered_prompt_hidden_rows = [
+                                    estimator_training_rows["prompt_hidden_rows"][idx] for idx in kept_traj_indices
+                                ]
+                                filtered_response_hidden_rows = [
+                                    estimator_training_rows["response_hidden_rows"][idx] for idx in kept_traj_indices
+                                ]
+                                filtered_response_feature_rows = [
+                                    estimator_training_rows["response_feature_rows"][idx] for idx in kept_traj_indices
+                                ]
+                                filtered_targets = [
+                                    estimator_training_rows["targets"][idx] for idx in kept_traj_indices
+                                ]
+
+                            if final_accumulation is not None:
+                                existing_final_uids = set(final_accumulation.non_tensor_batch["uid"])
+                                dedup_indices = [
+                                    i for i, uid in enumerate(filtered_batch.non_tensor_batch["uid"])
+                                    if uid not in existing_final_uids
+                                ]
+                                if dedup_indices:
+                                    filtered_batch = filtered_batch[dedup_indices]
+                                    if estimator_enabled:
+                                        filtered_prompt_hidden_rows = [
+                                            filtered_prompt_hidden_rows[i] for i in dedup_indices
+                                        ]
+                                        filtered_response_hidden_rows = [
+                                            filtered_response_hidden_rows[i] for i in dedup_indices
+                                        ]
+                                        filtered_response_feature_rows = [
+                                            filtered_response_feature_rows[i] for i in dedup_indices
+                                        ]
+                                        filtered_targets = [filtered_targets[i] for i in dedup_indices]
+                                else:
+                                    filtered_batch = None
+
+                            if filtered_batch is not None:
+                                if final_accumulation is None:
+                                    final_accumulation = filtered_batch
+                                else:
+                                    filtered_batch.meta_info.pop("global_token_num", None)
+                                    final_accumulation.meta_info.pop("global_token_num", None)
+                                    final_accumulation = DataProto.concat([final_accumulation, filtered_batch])
+
+                                if estimator_enabled:
+                                    if final_accumulation_estimator_rows is None:
+                                        final_accumulation_estimator_rows = {
+                                            "prompt_hidden_rows": filtered_prompt_hidden_rows,
+                                            "response_hidden_rows": filtered_response_hidden_rows,
+                                            "response_feature_rows": filtered_response_feature_rows,
+                                            "targets": filtered_targets,
+                                        }
+                                    else:
+                                        final_accumulation_estimator_rows["prompt_hidden_rows"].extend(
+                                            filtered_prompt_hidden_rows
+                                        )
+                                        final_accumulation_estimator_rows["response_hidden_rows"].extend(
+                                            filtered_response_hidden_rows
+                                        )
+                                        final_accumulation_estimator_rows["response_feature_rows"].extend(
+                                            filtered_response_feature_rows
+                                        )
+                                        final_accumulation_estimator_rows["targets"].extend(filtered_targets)
+
+                        num_final_prompts = (
+                            len(set(final_accumulation.non_tensor_batch["uid"]))
+                            if final_accumulation is not None
+                            else 0
+                        )
+
+                        alpha = zero_adv_prompt_count / seen_prompt_count if seen_prompt_count > 0 else 0.0
+                        crrl_metrics["crrl/group_filter/alpha"] = float(alpha)
+                        crrl_metrics["crrl/group_filter/default_br_size"] = float(default_br_size)
+                        crrl_metrics["crrl/group_filter/seen_prompts_total"] = float(seen_prompt_count)
+                        crrl_metrics["crrl/group_filter/zero_adv_prompts_total"] = float(zero_adv_prompt_count)
+                        crrl_metrics["crrl/group_filter/kept_prompts_total"] = float(
+                            seen_prompt_count - zero_adv_prompt_count
+                        )
+                        crrl_metrics["crrl/group_filter/rounds_total"] = float(group_filter_round_count)
+                        crrl_metrics["crrl/group_filter/generated_prompts_total"] = float(
+                            group_filter_generated_prompts_total
+                        )
+                        crrl_metrics["crrl/group_filter/generated_prompts_round_current"] = float(
+                            current_round_prompt_count
+                        )
+                        for round_idx, prompt_count in enumerate(group_filter_round_generated_prompt_counts, start=1):
+                            crrl_metrics[f"crrl/group_filter/round_{round_idx}_generated_prompts"] = float(
+                                prompt_count
+                            )
+
+                        if num_final_prompts < target_prompt_batch_size:
+                            batch_delta = target_prompt_batch_size - num_final_prompts
+                            estimated_br = int((adaptive_beta * batch_delta) / (1.0 - alpha + 1e-6))
+                            next_target = min(default_br_size, estimated_br)
+                            next_target = max(1, next_target)
+                            target_accumulation_size = next_target
+                            print(
+                                "[CRRL][GroupFilter] "
+                                f"effective={num_final_prompts}/{target_prompt_batch_size}, "
+                                f"need={batch_delta}, alpha={alpha:.4f}, next_br={next_target}"
+                            )
+                            with marked_timer("stop_profile", timing_raw):
+                                next_step_profile = (
+                                    self.global_steps + 1 in self.config.global_profiler.steps
+                                    if self.config.global_profiler.steps is not None
+                                    else False
+                                )
+                                self._stop_profiling(
+                                    curr_step_profile and not next_step_profile
+                                    if self.config.global_profiler.profile_continuous_steps
+                                    else curr_step_profile
+                                )
+                                prev_step_profile = curr_step_profile
+                                curr_step_profile = next_step_profile
+                            continue
+
+                        final_sample_indices = self._sample_full_prompt_indices(
+                            final_accumulation,
+                            target_prompt_count=target_prompt_batch_size,
+                            rollout_repeat=rollout_repeat,
+                        )
+                        batch = final_accumulation[final_sample_indices]
+                        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                        if estimator_enabled:
+                            if final_accumulation_estimator_rows is None:
+                                raise RuntimeError(
+                                    "Estimator is enabled but no filtered estimator rows were accumulated "
+                                    "for final batch."
+                                )
+
+                            final_prompt_hidden_rows = [
+                                final_accumulation_estimator_rows["prompt_hidden_rows"][idx]
+                                for idx in final_sample_indices
+                            ]
+                            final_response_hidden_rows = [
+                                final_accumulation_estimator_rows["response_hidden_rows"][idx]
+                                for idx in final_sample_indices
+                            ]
+                            final_response_feature_rows = [
+                                final_accumulation_estimator_rows["response_feature_rows"][idx]
+                                for idx in final_sample_indices
+                            ]
+                            final_targets = [
+                                final_accumulation_estimator_rows["targets"][idx] for idx in final_sample_indices
+                            ]
+                    else:
+                        prompt_rows_in_batch = len(batch.batch) // rollout_repeat
+                        if self.config.trainer.crrl.enable:
+                            crrl_metrics["crrl/group_filter/alpha"] = 0.0
+                            crrl_metrics["crrl/group_filter/default_br_size"] = float(default_br_size)
+                            crrl_metrics["crrl/group_filter/seen_prompts_total"] = float(prompt_rows_in_batch)
+                            crrl_metrics["crrl/group_filter/zero_adv_prompts_total"] = 0.0
+                            crrl_metrics["crrl/group_filter/kept_prompts_total"] = float(prompt_rows_in_batch)
+                            crrl_metrics["crrl/group_filter/rounds_total"] = 1.0
+                            crrl_metrics["crrl/group_filter/generated_prompts_total"] = float(prompt_rows_in_batch)
+                            crrl_metrics["crrl/group_filter/generated_prompts_round_current"] = float(
+                                prompt_rows_in_batch
+                            )
                         if estimator_enabled:
                             if estimator_training_rows is None:
                                 raise RuntimeError(
-                                    "Estimator is enabled but estimator_training_rows is missing before filtering."
+                                    "Estimator is enabled but estimator_training_rows is missing for final batch."
                                 )
-                            filtered_prompt_hidden_rows = [
-                                estimator_training_rows["prompt_hidden_rows"][idx] for idx in kept_traj_indices
-                            ]
-                            filtered_response_hidden_rows = [
-                                estimator_training_rows["response_hidden_rows"][idx] for idx in kept_traj_indices
-                            ]
-                            filtered_response_feature_rows = [
-                                estimator_training_rows["response_feature_rows"][idx] for idx in kept_traj_indices
-                            ]
-                            filtered_targets = [estimator_training_rows["targets"][idx] for idx in kept_traj_indices]
+                            final_prompt_hidden_rows = list(estimator_training_rows["prompt_hidden_rows"])
+                            final_response_hidden_rows = list(estimator_training_rows["response_hidden_rows"])
+                            final_response_feature_rows = list(estimator_training_rows["response_feature_rows"])
+                            final_targets = list(estimator_training_rows["targets"])
 
-                        if final_accumulation is not None:
-                            existing_final_uids = set(final_accumulation.non_tensor_batch["uid"])
-                            dedup_indices = [
-                                i for i, uid in enumerate(filtered_batch.non_tensor_batch["uid"])
-                                if uid not in existing_final_uids
-                            ]
-                            if dedup_indices:
-                                filtered_batch = filtered_batch[dedup_indices]
-                                if estimator_enabled:
-                                    filtered_prompt_hidden_rows = [filtered_prompt_hidden_rows[i] for i in dedup_indices]
-                                    filtered_response_hidden_rows = [filtered_response_hidden_rows[i] for i in dedup_indices]
-                                    filtered_response_feature_rows = [filtered_response_feature_rows[i] for i in dedup_indices]
-                                    filtered_targets = [filtered_targets[i] for i in dedup_indices]
-                            else:
-                                filtered_batch = None
-
-                        if filtered_batch is not None:
-                            if final_accumulation is None:
-                                final_accumulation = filtered_batch
-                            else:
-                                filtered_batch.meta_info.pop("global_token_num", None)
-                                final_accumulation.meta_info.pop("global_token_num", None)
-                                final_accumulation = DataProto.concat([final_accumulation, filtered_batch])
-
-                            if estimator_enabled:
-                                if final_accumulation_estimator_rows is None:
-                                    final_accumulation_estimator_rows = {
-                                        "prompt_hidden_rows": filtered_prompt_hidden_rows,
-                                        "response_hidden_rows": filtered_response_hidden_rows,
-                                        "response_feature_rows": filtered_response_feature_rows,
-                                        "targets": filtered_targets,
-                                    }
-                                else:
-                                    final_accumulation_estimator_rows["prompt_hidden_rows"].extend(
-                                        filtered_prompt_hidden_rows
-                                    )
-                                    final_accumulation_estimator_rows["response_hidden_rows"].extend(
-                                        filtered_response_hidden_rows
-                                    )
-                                    final_accumulation_estimator_rows["response_feature_rows"].extend(
-                                        filtered_response_feature_rows
-                                    )
-                                    final_accumulation_estimator_rows["targets"].extend(filtered_targets)
-
-                    num_final_prompts = (
-                        len(set(final_accumulation.non_tensor_batch["uid"])) if final_accumulation is not None else 0
-                    )
-
-                    alpha = zero_adv_prompt_count / seen_prompt_count if seen_prompt_count > 0 else 0.0
-                    crrl_metrics["crrl/group_filter/alpha"] = float(alpha)
-                    crrl_metrics["crrl/group_filter/default_br_size"] = float(default_br_size)
-                    crrl_metrics["crrl/group_filter/seen_prompts_total"] = float(seen_prompt_count)
-                    crrl_metrics["crrl/group_filter/zero_adv_prompts_total"] = float(zero_adv_prompt_count)
-                    crrl_metrics["crrl/group_filter/kept_prompts_total"] = float(
-                        seen_prompt_count - zero_adv_prompt_count
-                    )
-                    crrl_metrics["crrl/group_filter/rounds_total"] = float(group_filter_round_count)
-                    crrl_metrics["crrl/group_filter/generated_prompts_total"] = float(
-                        group_filter_generated_prompts_total
-                    )
-                    crrl_metrics["crrl/group_filter/generated_prompts_round_current"] = float(
-                        current_round_prompt_count
-                    )
-                    for round_idx, prompt_count in enumerate(group_filter_round_generated_prompt_counts, start=1):
-                        crrl_metrics[f"crrl/group_filter/round_{round_idx}_generated_prompts"] = float(prompt_count)
-
-                    if num_final_prompts < target_prompt_batch_size:
-                        batch_delta = target_prompt_batch_size - num_final_prompts
-                        estimated_br = int((adaptive_beta * batch_delta) / (1.0 - alpha + 1e-6))
-                        next_target = min(default_br_size, estimated_br)
-                        next_target = max(1, next_target)
-                        target_accumulation_size = next_target
-                        print(
-                            "[CRRL][GroupFilter] "
-                            f"effective={num_final_prompts}/{target_prompt_batch_size}, "
-                            f"need={batch_delta}, alpha={alpha:.4f}, next_br={next_target}"
-                        )
-                        with marked_timer("stop_profile", timing_raw):
-                            next_step_profile = (
-                                self.global_steps + 1 in self.config.global_profiler.steps
-                                if self.config.global_profiler.steps is not None
-                                else False
-                            )
-                            self._stop_profiling(
-                                curr_step_profile and not next_step_profile
-                                if self.config.global_profiler.profile_continuous_steps
-                                else curr_step_profile
-                            )
-                            prev_step_profile = curr_step_profile
-                            curr_step_profile = next_step_profile
-                        continue
-
-                    final_sample_indices = self._sample_full_prompt_indices(
-                        final_accumulation,
-                        target_prompt_count=target_prompt_batch_size,
-                        rollout_repeat=rollout_repeat,
-                    )
-                    batch = final_accumulation[final_sample_indices]
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     if self.config.trainer.crrl.enable:
-                        crrl_metrics["crrl/group_filter/final_sampled_prompts"] = float(target_prompt_batch_size)
-                        crrl_metrics["crrl/group_filter/final_sampled_trajectories"] = float(target_traj_batch_size)
+                        final_prompt_rows = len(batch.batch) // rollout_repeat
+                        crrl_metrics["crrl/group_filter/final_sampled_prompts"] = float(final_prompt_rows)
+                        crrl_metrics["crrl/group_filter/final_sampled_trajectories"] = float(len(batch.batch))
                         if group_filter_reward_count > 0:
                             crrl_metrics["crrl/reward"] = float(group_filter_reward_sum / group_filter_reward_count)
                         else:
@@ -1768,62 +2159,144 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         crrl_metrics["crrl/p_hats_final_batch"] = float(
                             final_batch_p_hats.mean().detach().cpu().item()
                         )
+
                     if estimator_enabled:
-                        if final_accumulation_estimator_rows is None:
-                            raise RuntimeError(
-                                "Estimator is enabled but no filtered estimator rows were accumulated for final batch."
-                            )
-
-                        final_prompt_hidden_rows = [
-                            final_accumulation_estimator_rows["prompt_hidden_rows"][idx]
-                            for idx in final_sample_indices
-                        ]
-                        final_response_hidden_rows = [
-                            final_accumulation_estimator_rows["response_hidden_rows"][idx]
-                            for idx in final_sample_indices
-                        ]
-                        final_response_feature_rows = [
-                            final_accumulation_estimator_rows["response_feature_rows"][idx]
-                            for idx in final_sample_indices
-                        ]
-                        final_targets = [
-                            final_accumulation_estimator_rows["targets"][idx]
-                            for idx in final_sample_indices
-                        ]
-
+                        final_prompt_hidden_rows = estimator_fit_accumulation_rows["prompt_hidden_rows"]
+                        final_response_hidden_rows = estimator_fit_accumulation_rows["response_hidden_rows"]
+                        final_response_feature_rows = estimator_fit_accumulation_rows["response_feature_rows"]
+                        final_targets = estimator_fit_accumulation_rows["targets"]
                         final_row_count = len(final_targets)
                         if not (
                             final_row_count
                             == len(final_prompt_hidden_rows)
                             == len(final_response_hidden_rows)
                             == len(final_response_feature_rows)
-                            == len(batch.batch)
                         ):
                             raise ValueError(
-                                "Final estimator rows are inconsistent with final training batch size: "
-                                f"rows={final_row_count}, batch={len(batch.batch)}"
+                                "Estimator fit rows are internally inconsistent: "
+                                f"targets={final_row_count}, prompt_hidden={len(final_prompt_hidden_rows)}, "
+                                f"response_hidden={len(final_response_hidden_rows)}, "
+                                f"response_features={len(final_response_feature_rows)}"
+                            )
+                        if final_row_count == 0:
+                            raise RuntimeError("Estimator is enabled but no rollout rows were accumulated for fitting.")
+
+                        crrl_metrics["crrl/adaptive_estimator/fit_rollout_rows_added"] = float(final_row_count)
+                        crrl_metrics["crrl/adaptive_estimator/fit_rollout_prompt_groups_added"] = float(
+                            final_row_count / max(1, rollout_repeat)
+                        )
+                        crrl_metrics["crrl/adaptive_estimator/final_train_batch_rows"] = float(len(batch.batch))
+                        crrl_metrics["crrl/adaptive_estimator/fit_to_train_batch_row_ratio"] = float(
+                            final_row_count / max(1, len(batch.batch))
+                        )
+                        online_pred_values_np = np.asarray(estimator_online_value_predictions, dtype=np.float32)
+                        online_target_values_np = np.asarray(estimator_online_targets, dtype=np.float32)
+                        if online_pred_values_np.shape != online_target_values_np.shape:
+                            raise ValueError(
+                                "Estimator online metric rows are inconsistent: "
+                                f"predictions={online_pred_values_np.shape}, targets={online_target_values_np.shape}"
+                            )
+                        if online_pred_values_np.size != final_row_count:
+                            raise ValueError(
+                                "Estimator online metric rows do not match fit rows: "
+                                f"metrics={online_pred_values_np.size}, fit_rows={final_row_count}"
+                            )
+
+                        online_target_errors = online_pred_values_np - online_target_values_np
+                        crrl_metrics["crrl/adaptive_estimator/online_target_mae"] = float(
+                            np.mean(np.abs(online_target_errors))
+                        )
+                        crrl_metrics["crrl/adaptive_estimator/online_target_rmse"] = float(
+                            np.sqrt(np.mean(np.square(online_target_errors)))
+                        )
+                        crrl_metrics["crrl/adaptive_estimator/online_target_bias"] = float(
+                            np.mean(online_target_errors)
+                        )
+                        pred_std = float(online_pred_values_np.std())
+                        target_std = float(online_target_values_np.std())
+                        if online_pred_values_np.size > 1 and pred_std > 1e-8 and target_std > 1e-8:
+                            online_target_pearson = float(
+                                np.corrcoef(online_pred_values_np, online_target_values_np)[0, 1]
+                            )
+                        else:
+                            online_target_pearson = 0.0
+                        if not np.isfinite(online_target_pearson):
+                            online_target_pearson = 0.0
+                        crrl_metrics["crrl/adaptive_estimator/online_target_pearson"] = online_target_pearson
+                        crrl_metrics["crrl/adaptive_estimator/fit_target_mean"] = float(
+                            online_target_values_np.mean()
+                        )
+
+                        online_rewards_np = np.asarray(estimator_online_rewards, dtype=np.float32)
+                        online_raw_advantages_np = np.asarray(estimator_online_raw_advantages, dtype=np.float32)
+                        if (
+                            online_rewards_np.size != final_row_count
+                            or online_raw_advantages_np.size != final_row_count
+                        ):
+                            raise ValueError(
+                                "Estimator online reward/advantage rows do not match fit rows: "
+                                f"rewards={online_rewards_np.size}, advantages={online_raw_advantages_np.size}, "
+                                f"fit_rows={final_row_count}"
+                            )
+                        reward_var = float(online_rewards_np.var())
+                        adv_var = float(online_raw_advantages_np.var())
+                        crrl_metrics["crrl/adaptive_estimator/adv_var_reduction_ratio"] = (
+                            adv_var / reward_var if reward_var > 1e-12 else 0.0
+                        )
+                        crrl_metrics["crrl/adaptive_estimator/pairwise_sign_acc"] = (
+                            float(np.mean(estimator_online_pairwise_sign_matches))
+                            if estimator_online_pairwise_sign_matches
+                            else 0.0
+                        )
+                        crrl_metrics["crrl/adaptive_estimator/pred_clip_frac_min"] = float(
+                            estimator_online_clip_min_count / final_row_count
+                        )
+                        crrl_metrics["crrl/adaptive_estimator/pred_clip_frac_max"] = float(
+                            estimator_online_clip_max_count / final_row_count
+                        )
+                        crrl_metrics["crrl/adaptive_estimator/pred_clip_min_count"] = float(
+                            estimator_online_clip_min_count
+                        )
+                        crrl_metrics["crrl/adaptive_estimator/pred_clip_max_count"] = float(
+                            estimator_online_clip_max_count
+                        )
+                        crrl_metrics["crrl/adaptive_estimator/pred_clip_min_reward_match_count"] = float(
+                            estimator_online_clip_min_reward_match_count
+                        )
+                        crrl_metrics["crrl/adaptive_estimator/pred_clip_max_reward_match_count"] = float(
+                            estimator_online_clip_max_reward_match_count
+                        )
+                        if estimator_online_clip_min_count > 0:
+                            crrl_metrics["crrl/adaptive_estimator/pred_clip_min_reward_match_frac"] = float(
+                                estimator_online_clip_min_reward_match_count / estimator_online_clip_min_count
+                            )
+                        if estimator_online_clip_max_count > 0:
+                            crrl_metrics["crrl/adaptive_estimator/pred_clip_max_reward_match_frac"] = float(
+                                estimator_online_clip_max_reward_match_count / estimator_online_clip_max_count
                             )
 
                         estimator_train_prompt_hidden_rows.extend(final_prompt_hidden_rows)
                         estimator_train_response_hidden_rows.extend(final_response_hidden_rows)
                         estimator_train_response_feature_rows.extend(final_response_feature_rows)
                         estimator_train_targets.extend(float(v) for v in final_targets)
+                        estimator_train_step_row_counts.append(final_row_count)
                         estimator_retrain_steps += 1
+                        fifo_trimmed_steps = 0
                         fifo_trimmed_rows = 0
-                        if len(estimator_train_targets) > estimator_buffer_max_rows:
-                            fifo_trimmed_rows = len(estimator_train_targets) - estimator_buffer_max_rows
-                            estimator_train_prompt_hidden_rows = estimator_train_prompt_hidden_rows[
-                                -estimator_buffer_max_rows:
-                            ]
-                            estimator_train_response_hidden_rows = estimator_train_response_hidden_rows[
-                                -estimator_buffer_max_rows:
-                            ]
-                            estimator_train_response_feature_rows = estimator_train_response_feature_rows[
-                                -estimator_buffer_max_rows:
-                            ]
-                            estimator_train_targets = estimator_train_targets[-estimator_buffer_max_rows:]
+                        while len(estimator_train_step_row_counts) > estimator_buffer_max_steps:
+                            rows_to_trim = estimator_train_step_row_counts.pop(0)
+                            fifo_trimmed_steps += 1
+                            fifo_trimmed_rows += rows_to_trim
+                            estimator_train_prompt_hidden_rows = estimator_train_prompt_hidden_rows[rows_to_trim:]
+                            estimator_train_response_hidden_rows = estimator_train_response_hidden_rows[rows_to_trim:]
+                            estimator_train_response_feature_rows = estimator_train_response_feature_rows[rows_to_trim:]
+                            estimator_train_targets = estimator_train_targets[rows_to_trim:]
                         crrl_metrics["crrl/adaptive_estimator/buffer_rows"] = float(len(estimator_train_targets))
-                        crrl_metrics["crrl/adaptive_estimator/fifo_max_rows"] = float(estimator_buffer_max_rows)
+                        crrl_metrics["crrl/adaptive_estimator/buffer_steps"] = float(
+                            len(estimator_train_step_row_counts)
+                        )
+                        crrl_metrics["crrl/adaptive_estimator/fifo_max_steps"] = float(estimator_buffer_max_steps)
+                        crrl_metrics["crrl/adaptive_estimator/fifo_trimmed_steps"] = float(fifo_trimmed_steps)
                         crrl_metrics["crrl/adaptive_estimator/fifo_trimmed_rows"] = float(fifo_trimmed_rows)
                         crrl_metrics["crrl/adaptive_estimator/warmup_steps"] = float(estimator_warmup_steps)
                         crrl_metrics["crrl/adaptive_estimator/warmup_remaining_steps"] = float(
@@ -1891,10 +2364,51 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                             crrl_metrics["crrl/adaptive_estimator/window_rows_used_for_fit"] = float(
                                 len(estimator_train_targets)
                             )
+                            crrl_metrics["crrl/adaptive_estimator/window_steps_used_for_fit"] = float(
+                                len(estimator_train_step_row_counts)
+                            )
+
+                    if self.config.trainer.crrl.enable:
+                        if prompt_reward_log_dir is None:
+                            raise RuntimeError("CRRL prompt reward log directory is not initialized.")
+                        with marked_timer("dump_prompt_reward_log", timing_raw, color="green"):
+                            prompt_reward_log_path = self._dump_prompt_reward_log(
+                                output_dir=prompt_reward_log_dir,
+                                accumulator=prompt_reward_log_accumulator,
+                                order=prompt_reward_log_order,
+                                group_filter_enabled=crrl_group_filter_enabled,
+                                rollout_repeat=rollout_repeat,
+                                rounds_total=group_filter_round_count,
+                                final_train_batch_rows=len(batch.batch),
+                            )
+                        crrl_metrics["crrl/prompt_reward_log/prompt_count"] = float(
+                            len(prompt_reward_log_order)
+                        )
+                        crrl_metrics["crrl/prompt_reward_log/trajectory_count"] = float(
+                            sum(
+                                len(prompt_reward_log_accumulator[uid]["rollout_rewards"])
+                                for uid in prompt_reward_log_order
+                            )
+                        )
+                        crrl_metrics["crrl/prompt_reward_log/wrote_file"] = float(
+                            bool(prompt_reward_log_path)
+                        )
 
                     final_accumulation = None
                     final_accumulation_estimator_rows = None
-                    target_accumulation_size = default_br_size
+                    estimator_fit_accumulation_rows = self._new_estimator_row_buffer()
+                    estimator_online_value_predictions = []
+                    estimator_online_targets = []
+                    estimator_online_raw_advantages = []
+                    estimator_online_rewards = []
+                    estimator_online_pairwise_sign_matches = []
+                    estimator_online_clip_min_count = 0
+                    estimator_online_clip_max_count = 0
+                    estimator_online_clip_min_reward_match_count = 0
+                    estimator_online_clip_max_reward_match_count = 0
+                    target_accumulation_size = (
+                        default_br_size if crrl_group_filter_enabled else target_prompt_batch_size
+                    )
                     seen_prompt_count = 0
                     zero_adv_prompt_count = 0
                     group_filter_round_count = 0
@@ -1904,6 +2418,8 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                     group_filter_reward_count = 0
                     group_filter_p_hat_sum = 0.0
                     group_filter_p_hat_count = 0
+                    prompt_reward_log_accumulator = {}
+                    prompt_reward_log_order = []
                     micro_prompts = batch.non_tensor_batch.get("raw_prompt", None)
                     micro_prompts = [_[0]["content"].strip() for _ in micro_prompts]
 
@@ -1922,6 +2438,23 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                    if estimator_enabled:
+                        if estimator_update_output_dir is None:
+                            raise RuntimeError("Adaptive estimator update output directory is not initialized.")
+                        with marked_timer("save_estimator_update", timing_raw, color="green"):
+                            estimator_update_snapshot_path = self._save_adaptive_estimator_update_snapshot(
+                                output_dir=estimator_update_output_dir,
+                                estimator_model_path=estimator_current_model_path,
+                                estimator_bundle=estimator_current_bundle,
+                                retrain_steps=estimator_retrain_steps,
+                                retrain_count=estimator_retrain_count,
+                                train_targets=estimator_train_targets,
+                                train_step_row_counts=estimator_train_step_row_counts,
+                            )
+                        crrl_metrics["crrl/adaptive_estimator/update_snapshot_saved"] = float(
+                            estimator_update_snapshot_path is not None
+                        )
 
                     if self.config.trainer.crrl.enable:
                         if crrl_weighted_sampling:
@@ -1982,6 +2515,7 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 train_response_hidden_rows=estimator_train_response_hidden_rows,
                                 train_response_feature_rows=estimator_train_response_feature_rows,
                                 train_targets=estimator_train_targets,
+                                train_step_row_counts=estimator_train_step_row_counts,
                             )
                         else:
                             self._clear_adaptive_estimator_checkpoint_state()
@@ -2025,6 +2559,7 @@ class RayPPOTrainer(BaseRayPPOTrainer):
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                timing_raw = defaultdict(float)
 
                 progress_bar.update(1)
                 self.global_steps += 1

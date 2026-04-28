@@ -30,6 +30,8 @@ ESTIMATOR_FEATURE_BUILDER_CONFIG=${ESTIMATOR_FEATURE_BUILDER_CONFIG:-"recipe/Cro
 ESTIMATOR_FIT_CONFIG=${ESTIMATOR_FIT_CONFIG:-"recipe/CrossRolloutRL/estimator/single_trajectory_estimator_support/simple_structure_estimator_fit_config.json"}
 ESTIMATOR_PAIR_SIZE=${ESTIMATOR_PAIR_SIZE:-2}
 ESTIMATOR_WARMUP_STEPS=${ESTIMATOR_WARMUP_STEPS:-4}
+ESTIMATOR_BUFFER_MAX_STEPS=${ESTIMATOR_BUFFER_MAX_STEPS:-4}
+ESTIMATOR_ONLINE_OUTPUT_DIR=${ESTIMATOR_ONLINE_OUTPUT_DIR:-null}
 CRRL_MISSING_PROMPT=${CRRL_MISSING_PROMPT:-"default"} # error | default
 CRRL_DEFAULT_P_HAT=${CRRL_DEFAULT_P_HAT:-0.5}
 CRRL_WEIGHTED_SAMPLING=${CRRL_WEIGHTED_SAMPLING:-"False"}
@@ -82,6 +84,8 @@ gen_batch_size=8
 CRRL_DEFAULT_BR_SIZE=${CRRL_DEFAULT_BR_SIZE:-614}
 CRRL_BETA=${CRRL_BETA:-1.25}
 CRRL_ADVANTAGE_ZERO_EPS=${CRRL_ADVANTAGE_ZERO_EPS:-1e-8}
+CRRL_PROMPT_REWARD_LOG_DIR=${CRRL_PROMPT_REWARD_LOG_DIR:-null}
+CRRL_GROUP_FILTER_ENABLE=${CRRL_GROUP_FILTER_ENABLE:-"True"}
 crrl_enable=True
 
 # Canonicalize mode and enforce supported options.
@@ -175,7 +179,7 @@ python3 -m recipe.CrossRolloutRL.crrl_main_ppo \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node=$train_sp \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.log_val_generations=5 \
     trainer.nnodes=1 \
     trainer.default_local_dir=$default_local_dir \
@@ -189,9 +193,13 @@ python3 -m recipe.CrossRolloutRL.crrl_main_ppo \
     trainer.crrl.missing_prompt=$CRRL_MISSING_PROMPT \
     trainer.crrl.default_p_hat=$CRRL_DEFAULT_P_HAT \
     trainer.crrl.weighted_sampling=$CRRL_WEIGHTED_SAMPLING \
+    trainer.crrl.group_filter.enable=$CRRL_GROUP_FILTER_ENABLE \
+    trainer.crrl.prompt_reward_log_dir=$CRRL_PROMPT_REWARD_LOG_DIR \
     trainer.crrl.estimator.model_path=$ESTIMATOR_MODEL_PATH \
     trainer.crrl.estimator.feature_builder_config_path=$ESTIMATOR_FEATURE_BUILDER_CONFIG \
     trainer.crrl.estimator.fit_config_path=$ESTIMATOR_FIT_CONFIG \
     trainer.crrl.estimator.pair_size=$ESTIMATOR_PAIR_SIZE \
     trainer.crrl.estimator.warmup_steps=$ESTIMATOR_WARMUP_STEPS \
+    trainer.crrl.estimator.buffer_max_steps=$ESTIMATOR_BUFFER_MAX_STEPS \
+    trainer.crrl.estimator.online_output_dir=$ESTIMATOR_ONLINE_OUTPUT_DIR \
     trainer.debug=$DEBUG  \
