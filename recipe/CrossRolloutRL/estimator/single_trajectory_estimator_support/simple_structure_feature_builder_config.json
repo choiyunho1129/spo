@@ -19,20 +19,7 @@
     "scalar_keys": [
       "output_mean_token_entropy",
       "reasoning_mean_token_entropy",
-      "output_last_token_entropy",
-      "output_max_token_entropy",
-      "output_min_token_entropy",
-      "reasoning_last_token_entropy",
-      "reasoning_max_token_entropy",
-      "reasoning_min_token_entropy",
-      "answer_last_token_entropy",
-      "answer_max_token_entropy",
-      "answer_mean_token_entropy",
-      "answer_min_token_entropy"
-    ],
-    "derived_scalar_keys": [
-      "entropy_gap_reasoning_answer",
-      "answer_entropy_gap_vs_output"
+      "answer_mean_token_entropy"
     ]
   }
 }
