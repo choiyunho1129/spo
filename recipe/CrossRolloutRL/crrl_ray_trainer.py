@@ -1946,9 +1946,6 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 config=self.config.algorithm,
                             )
 
-                    if self.config.trainer.crrl.enable:
-                        crrl_metrics["crrl/group_filter/enabled"] = float(crrl_group_filter_enabled)
-
                     final_prompt_hidden_rows = None
                     final_response_hidden_rows = None
                     final_response_feature_rows = None
@@ -2372,7 +2369,7 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         if prompt_reward_log_dir is None:
                             raise RuntimeError("CRRL prompt reward log directory is not initialized.")
                         with marked_timer("dump_prompt_reward_log", timing_raw, color="green"):
-                            prompt_reward_log_path = self._dump_prompt_reward_log(
+                            self._dump_prompt_reward_log(
                                 output_dir=prompt_reward_log_dir,
                                 accumulator=prompt_reward_log_accumulator,
                                 order=prompt_reward_log_order,
@@ -2389,9 +2386,6 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 len(prompt_reward_log_accumulator[uid]["rollout_rewards"])
                                 for uid in prompt_reward_log_order
                             )
-                        )
-                        crrl_metrics["crrl/prompt_reward_log/wrote_file"] = float(
-                            bool(prompt_reward_log_path)
                         )
 
                     final_accumulation = None
@@ -2443,7 +2437,7 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                         if estimator_update_output_dir is None:
                             raise RuntimeError("Adaptive estimator update output directory is not initialized.")
                         with marked_timer("save_estimator_update", timing_raw, color="green"):
-                            estimator_update_snapshot_path = self._save_adaptive_estimator_update_snapshot(
+                            self._save_adaptive_estimator_update_snapshot(
                                 output_dir=estimator_update_output_dir,
                                 estimator_model_path=estimator_current_model_path,
                                 estimator_bundle=estimator_current_bundle,
@@ -2452,9 +2446,6 @@ class RayPPOTrainer(BaseRayPPOTrainer):
                                 train_targets=estimator_train_targets,
                                 train_step_row_counts=estimator_train_step_row_counts,
                             )
-                        crrl_metrics["crrl/adaptive_estimator/update_snapshot_saved"] = float(
-                            estimator_update_snapshot_path is not None
-                        )
 
                     if self.config.trainer.crrl.enable:
                         if crrl_weighted_sampling:
