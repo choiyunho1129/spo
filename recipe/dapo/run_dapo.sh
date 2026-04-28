@@ -61,7 +61,6 @@ rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
 use_dynamic_bsz=True
 actor_max_token_len_per_gpu=$(((max_prompt_length + max_response_length) * 1))
 log_prob_max_token_len_per_gpu=$((actor_max_token_len_per_gpu * 4))
-offload=False
 
 python3 -m recipe.dapo.main_dapo \
     data.train_files="${train_files}" \
@@ -119,7 +118,6 @@ python3 -m recipe.dapo.main_dapo \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.val_kwargs.n=8 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     custom_reward_function.path="${custom_data_and_reward_path}" \
     custom_reward_function.name=compute_score \
     reward_model.reward_manager=dapo \

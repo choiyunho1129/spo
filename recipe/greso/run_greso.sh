@@ -60,7 +60,7 @@ rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
 use_dynamic_bsz=True
 actor_max_token_len_per_gpu=$(((max_prompt_length + max_response_length) * 1))
 log_prob_max_token_len_per_gpu=$((actor_max_token_len_per_gpu * 4))
-offload=False
+offload=True
 
 # GRESO-only configs
 greso_p_easy=${GRESO_P_EASY:-0.5}
@@ -128,7 +128,6 @@ python3 -m recipe.greso.main_greso \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=8 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     custom_reward_function.path="${custom_data_and_reward_path}" \
     custom_reward_function.name=compute_score \
     reward_model.reward_manager=dapo \
